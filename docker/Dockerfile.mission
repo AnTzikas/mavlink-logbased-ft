@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install python packages for wrapper
 RUN pip install --no-cache-dir pymavlink sysv_ipc
 
-COPY core /app/src
+COPY src /app/src
 COPY mission /app/missions
 
 WORKDIR /app/src

@@ -12,7 +12,7 @@ import sysv_ipc
 COMMAND = os.environ.get("COMMAND", "python3 /app/surveillance_mission.py")
 APP_NAME = os.environ.get("APP_NAME", "surveillance_mission.py")
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", 120))
-
+CHECKPOINT = int(os.environ.get("CHECKPOINT", "1"))
 
 CHECKPOINT_BASEDIR = os.environ.get("CHECKPOINT_BASEDIR", "/mnt/checkpoints")
 CHECKPOINT_DIR = f"{CHECKPOINT_BASEDIR}/checkpoint"
@@ -46,7 +46,7 @@ class Supervisor:
 
     def _initialize_mission(self):
         chkpt_path = pathlib.Path(CHECKPOINT_DIR) # Add this line
-        if any(chkpt_path.iterdir()):
+        if CHECKPOINT and any(chkpt_path.iterdir()):
             # Restore mission program
             print("\n\n\n[Supervisor]: Found existing checkpoint. Restoring...")
             
@@ -121,8 +121,7 @@ class Supervisor:
     def run(self):
         """Main lifecycle controller."""
 
-        checkpoint_dir = os.environ.get("CHECKPOINT_BASEDIR", "/mnt/checkpoints")
-        flag_path = os.path.join(checkpoint_dir, "mission_completed.flag")
+        flag_path = os.path.join(f"{CHECKPOINT_BASEDIR}/mission_logs", "mission_completed.flag")
 
         while True:
             if not self._initialize_mission():
@@ -138,15 +137,15 @@ class Supervisor:
                     while elapsed < CHECKPOINT_INTERVAL:
                         if self.get_pid_by_name() is None:
                             if os.path.exists(flag_path):
-                                print("[Supervisor] Mission terminated. Exiting.")
+                                print("[Supervisor] Mission completed. Exiting.")
                                 return
                             else:
                                 os._exit(137)
                         time.sleep(2)
                         elapsed += 2
 
-                    
-                    self._perform_checkpoint()
+                    if CHECKPOINT:
+                        self._perform_checkpoint()
 
             except KeyboardInterrupt:
                 # print("[Supervisor] Shutdown signal received.")

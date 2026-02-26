@@ -42,7 +42,7 @@ BASE_DIR = os.environ.get("CHECKPOINT_BASEDIR", "/mnt/checkpoints")
 LOG_DIR = f"{BASE_DIR}/mission_logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 # timestamp = int(time.time())
-MISSION_LOGFILE= f"{LOG_DIR}/mission_log_{FAIL_PHASE}.csv"
+#MISSION_LOGFILE= f"{LOG_DIR}/mission_log_{FAIL_PHASE}.csv"
 
 if FAIL_ENABLE:
     print(f"Mission program started with fail injection at lap {FAIL_LAP} and waypoint {FAIL_WP}")
@@ -65,12 +65,12 @@ def maybe_fail(phase, lap=None, wp=None):
         os._exit(137)
 
 def log_metric(event, active_sysid=None, lap=None, wp=None, extra=""):
-
-    with open(MISSION_LOGFILE, "a") as f:
-        ts = datetime.now().strftime("%H:%M:%S.%f")
-        f.write(f"{ts},{event},{active_sysid},{lap},{wp},{extra}\n")
-        f.flush()
-        os.fsync(f.fileno())
+    pass
+    # with open(MISSION_LOGFILE, "a") as f:
+    #     ts = datetime.now().strftime("%H:%M:%S.%f")
+    #     f.write(f"{ts},{event},{active_sysid},{lap},{wp},{extra}\n")
+    #     f.flush()
+    #     os.fsync(f.fileno())
 
 def fetch_position(conn, sysid):
     """Filters stream for specific System ID and reports status."""
@@ -176,7 +176,7 @@ class RelayController:
         # )
         self.wait_for_ekf_gps(1)
         # self.wait_for_ekf_gps(2)
-        log_metric("INIT_COMMS", extra="both_systems_detected")
+        # log_metric("INIT_COMMS", extra="both_systems_detected")
         logger.info("--- SYSTEM READY ---")
 
     def wait_for_ekf_gps(self, sysid):

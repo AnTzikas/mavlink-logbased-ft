@@ -11,7 +11,7 @@ from wrapper.interaction_journal import InteractionJournal
 from wrapper import replay_buffer
 from wrapper.replay_buffer import ReplayBuffer
 from wrapper.ipc_sem import IPCClient
-# from src.ipc_sem import IPCClient
+
 
 # Proxy class for intercepting outgoing commands (e.g., master.mav.command_long_send)
 class _MavSenderProxy:
@@ -141,7 +141,7 @@ class MavlinkWrapper:
             
             os.makedirs(LOG_DIR, exist_ok=True)
             timestamp = int(time.time())
-            self._evidence_path = f"{LOG_DIR}/wrapper_log_{timestamp}.csv"
+            self._evidence_path = f"{LOG_DIR}/wrapper_log.csv"
 
     '''Intercepted Primitives'''
     
@@ -204,7 +204,7 @@ class MavlinkWrapper:
 
         # Create mission complete flag
         checkpoint_dir = os.environ.get("CHECKPOINT_BASEDIR", "/mnt/checkpoints")
-        flag_path = os.path.join(checkpoint_dir, "mission_completed.flag")
+        flag_path = os.path.join(f"{checkpoint_dir}/mission_logs", "mission_completed.flag")
         
         try:
             with open(flag_path, 'w') as f:

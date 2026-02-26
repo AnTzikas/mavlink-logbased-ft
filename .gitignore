@@ -1,0 +1,5 @@
+experiment_logs/checkpoint/*
+experiment_logs/container_logs/*
+experiment_logs/logfiles/*
+experiment_logs/mission_logs/*
+experiment_logs/wrapper_logs/*
