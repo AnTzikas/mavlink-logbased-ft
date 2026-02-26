@@ -1,0 +1,13 @@
+services:
+  uav_mission_1:
+    image: mission-container:latest
+    container_name: uav_mission_1
+    privileged: true
+    network_mode: host
+    env_file:
+      - ../../mission/mission.env
+    volumes:
+      - ../../experiment_logs:/mnt/checkpoints
+    stdin_open: true
+    tty: true
+    restart: "no"

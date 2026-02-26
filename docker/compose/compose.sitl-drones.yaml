@@ -1,0 +1,35 @@
+services:
+  uav1:
+    image: ardupilot-sitl:latest
+    container_name: uav1
+    network_mode: "host"
+    stdin_open: true
+    tty: true
+    # This matches your manual run perfectly
+    command: >
+      python3 /ardupilot/Tools/autotest/sim_vehicle.py 
+      -v ArduCopter 
+      -f quad 
+      -I 0 
+      --no-rebuild 
+      --sysid 1 
+      --out=udp:127.0.0.1:14550 
+      --out=udp:127.0.0.1:14551
+    
+  uav2:
+    image: ardupilot-sitl:latest
+    container_name: uav2
+    network_mode: "host"
+    stdin_open: true
+    tty: true
+    # This matches your manual run perfectly
+    command: >
+      python3 /ardupilot/Tools/autotest/sim_vehicle.py 
+      -v ArduCopter 
+      -f quad 
+      -I 1
+      --sysid 2 
+      --no-rebuild 
+      --out=udp:127.0.0.1:14550 
+      --out=udp:127.0.0.1:14551
+  

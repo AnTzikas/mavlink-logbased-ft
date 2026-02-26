@@ -1,0 +1,191 @@
+import subprocess
+import time
+import os
+import argparse
+import sys
+
+# Configuration aligned with Guidelines A.1
+SITL_IMAGE = os.getenv("SITL_IMAGE","ardupilot-sitl:latest")
+SITL_COMMAND = "docker compose -f docker/compose/compose.sitl-drones.yaml"
+
+MISSION_IMAGE = os.getenv("MISSION_IMAGE", "mission-container:latest")
+# MISSION_COMMAND = "docker compose -f docker/compose/compose.mission.yaml"
+
+CHECKPOINTS_DIR = os.getenv("CHECKPOINTS_HOST_DIR", f"{os.getcwd()}/experiment_logs")
+ENV_FILE = os.getenv("ENV_FILE", f"mission/mission.env")
+MISSION_CONTAINER_LOGFILE = "container_logs/mission_container.log"
+DRONE_CONTAINER_LOGFILE = "container_logs/ardupilot_output.log"
+CRASH_RECOVERY_TIME = int(os.getenv("CRASH_RECOVERY_TIME", "40"))
+
+def run_cmd(cmd, detach=False, log_file=None):
+    if detach:
+        # Open the file in write mode
+        out = open(log_file, 'a') if log_file else None
+        # Start the process and send output to the file
+        return subprocess.Popen(cmd, shell=True, stdout=out, stderr=out)
+    return subprocess.run(cmd, shell=True, check=True)
+
+def run_mission_timewindow_crash(mission_cmd, crash_times):
+    
+
+    crash_times.sort()
+
+    if len(crash_times) != len(set(crash_times)):
+        raise SystemExit("Error: crash times must be unique (no duplicates).")
+
+    # Convert absolute times -> per-phase survival durations (deltas)
+    # Example: [60,120,180] -> [60,60,60]
+    deltas = []
+    prev = 0
+    for t in crash_times:
+        deltas.append(t - prev)
+        prev = t
+
+    # Schedule: crash phases, then one final run to completion (no crash)
+    crash_schedule = deltas + [None] 
+
+    for i, interval in enumerate(crash_schedule):
+        is_last = (i == len(crash_schedule) - 1)
+
+        if interval is None:
+            print("\nStarting Mission (No Crash Scheduled)")
+        else:
+            # interval can be 0 if the user asked for a crash at t=0 (immediate crash)
+            print(f"\nStarting Mission (Crash after {interval}s) ---")
+
+        # Start the mission container
+        mission_proc = run_cmd(mission_cmd, detach=True, log_file=MISSION_CONTAINER_LOGFILE)
+
+        if interval is None:
+            # Final run: wait until mission exits naturally
+            mission_proc.wait()
+        else:
+            # Crash phase: wait 'interval' seconds then kill and restart in next loop iteration
+            if interval > 0:
+                time.sleep(interval)
+
+            print(F"Killing mission_container\nWait {CRASH_RECOVERY_TIME} seconds before restarting container")
+            time.sleep(1)
+            run_cmd("docker kill mission_container")
+            # subprocess.run("docker kill mission_container", shell=True, capture_output=True)
+            time.sleep(CRASH_RECOVERY_TIME)
+
+def run_mission_phase_crash(mission_cmd, phase_args):
+
+    defaults = [None, "2", "3"]
+    # Slice phase_args to prevent index errors, then pad with defaults
+    params = (phase_args + defaults[len(phase_args):])[:3]
+    
+    phase_name, lap_str, wp_str = params
+
+    # 2. Final validation/conversion
+    try:
+        lap_idx = int(lap_str)
+        wp_idx = int(wp_str)
+    except ValueError:
+        print("Error: Lap and Waypoint must be integers.")
+        return
+
+    print(f"\n--- [Phase-Based Fault Injection] ---")
+    print(f"Targeting: Phase='{phase_name}', Lap={lap_idx}, WP={wp_idx}")
+
+    # 3. Inject flags into the command
+    injection_flags = [
+        f"-e FAIL_ENABLE=1 ",
+        f"-e FAIL_PHASE={phase_name} ",
+        f"-e FAIL_LAP={lap_idx} ",
+        f"-e FAIL_WP={wp_idx} "
+    ]
+
+    # Insert flags into mission_cmd
+    cmd_parts = mission_cmd.split()
+    image_name = cmd_parts[-1]
+    base_args = cmd_parts[:-1] # Everything except the image name
+    
+    # Reassemble: [docker, run, ..., -e flags, image_name]
+    final_cmd_list = base_args + injection_flags + [image_name]
+    final_cmd = " ".join(final_cmd_list)
+
+    print(final_cmd)
+    
+    # --- Execution Logic ---
+    print(f"Starting Run 1: Execution until internal crash...")
+    proc = run_cmd(final_cmd, detach=True, log_file=MISSION_CONTAINER_LOGFILE)
+    exit_code = proc.wait()
+    if exit_code == 0:
+        print(f"Run 1 exited with code {exit_code}. Crash injeciton failed...")
+        return
+    print(f"Run 1 exited with code {exit_code}. Starting Recovery Run...")
+    time.sleep(CRASH_RECOVERY_TIME)
+
+    proc_recovery = run_cmd(final_cmd, detach=True, log_file=MISSION_CONTAINER_LOGFILE)
+    final_exit = proc_recovery.wait()
+    
+    if final_exit == 0:
+        print("SUCCESS: Mission recovered and completed.")
+    else:
+        print(f"FAILURE: Recovery run exited with code {final_exit}.")
+
+def main():
+    
+    #Cleanup old logfiles
+    with open(MISSION_CONTAINER_LOGFILE, 'a') as f:
+        pass
+    with open(DRONE_CONTAINER_LOGFILE, 'a') as f:
+        pass
+    run_cmd("rm -rf container_logs/checkpoint")
+    run_cmd("rm -rf container_logs/logfiles")
+
+
+    print(f"Starting SITL UAV1 and UAV2...")
+    # Outcome F1: Drone swarm availability
+    sitl_cmd = (f"{SITL_COMMAND} up")
+    run_cmd(sitl_cmd, True, DRONE_CONTAINER_LOGFILE)
+    # run_cmd(sitl_cmd)
+    print("Waiting 10s for SITL initialization...")
+    time.sleep(10)
+
+    print(f"Launching Mission Container")
+    
+
+    mission_cmd = (
+        f"docker run -it --rm --name mission_container --network host --privileged "
+        f"-v {CHECKPOINTS_DIR}:/mnt/checkpoints --env-file {ENV_FILE} {MISSION_IMAGE}"
+    )
+
+    parser = argparse.ArgumentParser()
+    # Accept anything as a positional argument
+    parser.add_argument(
+        "args",
+        nargs="*",
+        help="Either timed crashes (60 120) or phase crash (AFTER_SEND 1 4)"
+    )
+    parsed = parser.parse_args()
+
+    # 2. Branching Logic
+    if not parsed.args:
+        # No arguments: standard run
+        print("Standard run: No failures scheduled.")
+        run_mission_timewindow_crash(mission_cmd, [])
+    
+    elif parsed.args[0].isdigit():
+        # Case A: Timed Crashes (e.g., "60 120")
+        # Convert the strings to integers for the timed function
+        timed_crashes = [int(x) for x in parsed.args]
+        print(f"Executing Timed Crash Scenario at: {timed_crashes}s")
+        run_mission_timewindow_crash(mission_cmd, timed_crashes)
+    
+    else:
+        # Case B: Phase Crashes (e.g., "AFTER_SEND 1 4")
+        # Branch to your other function (Phase, Lap, WP)
+        print(f"Executing Phase-based Failure Scenario: {parsed.args}")
+        run_mission_phase_crash(mission_cmd, parsed.args)
+
+    # --- CLEANUP SECTION ---
+    print("\n--- [Outcome] Evaluation complete. Cleaning up... ---")
+    run_cmd(f"{SITL_COMMAND} down")
+    
+    
+
+if __name__ == "__main__":
+    main()

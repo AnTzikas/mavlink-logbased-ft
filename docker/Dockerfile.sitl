@@ -1,0 +1,24 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV USER=root
+
+# Install minimal prerequisites
+RUN apt-get update && apt-get install -y \
+    git python3-pip python3-dev wget procps tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone ArduPilot (shallow clone to save space)
+RUN git clone --depth 1 https://github.com/ArduPilot/ardupilot.git /ardupilot
+WORKDIR /ardupilot
+
+# Initialize submodules and install python dependencies
+RUN git submodule update --init --recursive
+RUN pip3 install --no-cache-dir pymavlink MAVProxy pexpect empy==3.3.4 future
+
+# Pre-compile the SITL binary so it starts instantly
+RUN ./modules/waf/waf-light configure --board sitl
+RUN ./modules/waf/waf-light copter
+
+# Expose ports for QGroundControl and your mission
+EXPOSE 14550/udp 14551/udp

@@ -1,0 +1,32 @@
+# Python version
+FROM python:3.11-slim
+
+# Update packages and install necessary dependencies for CRIU
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    criu \
+    iproute2 \
+    iputils-ping \
+    procps \
+    sudo \
+    libnftables1 \
+    nftables \
+    iptables \
+    curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install python packages for wrapper
+RUN pip install --no-cache-dir pymavlink sysv_ipc
+
+COPY core /app/src
+COPY mission /app/missions
+
+WORKDIR /app/src
+
+# Configure passwordless sudo for all users, needed to call CRIU
+# RUN echo "ALL ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/nopasswd && \
+#     chmod 0440 /etc/sudoers.d/nopasswd
+
+# Command to run script
+CMD ["python3", "supervisor.py"]
+
+
