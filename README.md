@@ -1,10 +1,10 @@
 # Fault Tolerance for MAVLink-based Mission Programs Using Checkpointing and Logging
 
-This artifact accompanies the paper **"Fault Tolerance for MAVLink-based Mission Programs Using Checkpointing and Logging"**, submitted to the **26th International Conference on Distributed Applications and Interoperable Systems (DAIS 26)**.
+This repository contains the full implementation of a fault-tolerance mechanism for MAVLink-based mission programs, developed as part of a thesis at the Department of Electrical and Computer Engineering, University of Thessaly.
 
-It contains the full implementation of the proposed fault-tolerance mechanism, enabling reproducible evaluation of crash–restart behavior, including checkpoint-based recovery and log-based replay. For ease of evaluation, the artifact provides a container-only setup that does not require Kubernetes or external storage services. This simplified deployment preserves the functional behavior necessary to validate the correctness and performance claims presented in the paper.
+The system enables reproducible evaluation of crash-restart behavior, incorporating both checkpoint-based recovery and log-based replay. To simplify deployment and use, the implementation is provided as a container-based setup that does not require Kubernetes or external storage services, while preserving the functional behavior necessary for validating correctness and performance.
 
-The included mission program implements the patrol workload described in the paper: two drones patrol predefined waypoints and perform a battery-based handover when the first drone's battery level drops below a configured threshold. Crash scenarios can be introduced either manually or via the provided automation script, allowing systematic validation of recovery correctness and replay behavior.
+The included mission program implements a patrol workload in which two drones follow predefined waypoints and perform a battery-aware handover when the first drone's battery level drops below a configurable threshold. Crash scenarios can be introduced either manually or via the provided automation script, enabling systematic evaluation of recovery correctness and replay behavior.
 
 Clone the code from the repo:
 
