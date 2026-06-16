@@ -1,0 +1,13 @@
+Το έβαλα σε ένα φάκελο multidrone_controller στο κανάλι
+
+δεν το εχω τεστάρει διεξοδικα αλλα με λιγα τεστ παιζει.
+
+το τρέχεις  
+
+python3 multidrone_controller.py --config fleet --mission mission.waypoints --autonomy 170
+
+έχω και ένα indicative mission
+
+στο fleet βάλε τα connections που θα έχεις εσύ
+
+το autonomy είναι σε μέτρα (ναι το 170 ειναι πολυ μικρό γιατί και η αποστολή mission.waypoints ήταν μικρή)

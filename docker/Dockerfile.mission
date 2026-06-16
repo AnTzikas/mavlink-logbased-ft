@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir pymavlink sysv_ipc
 
 COPY src /app/src
-COPY mission /app/missions
+COPY mission/ /app/missions/
 
 WORKDIR /app/src
 
@@ -27,6 +27,7 @@ WORKDIR /app/src
 #     chmod 0440 /etc/sudoers.d/nopasswd
 
 # Command to run script
-CMD ["python3", "supervisor.py"]
+# CMD ["sleep", "infinity"]
+CMD ["python3", "-u", "supervisor.py"]
 
 

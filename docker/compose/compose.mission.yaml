@@ -1,7 +1,7 @@
 services:
-  uav_mission_1:
-    image: mission-container:latest
-    container_name: uav_mission_1
+  patrol_mission:
+    image: antzikas/mission-container:latest
+    container_name: patrol_mission
     privileged: true
     network_mode: host
     env_file:
@@ -10,4 +10,4 @@ services:
       - ../../experiment_logs:/mnt/checkpoints
     stdin_open: true
     tty: true
-    restart: "no"
+    restart: "on-failure"

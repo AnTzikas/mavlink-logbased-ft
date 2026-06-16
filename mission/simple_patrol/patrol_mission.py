@@ -9,7 +9,7 @@ from pathlib import Path
 
 # Include Wrapper or Default Pymavlink
 current_dir = Path(__file__).resolve().parent
-sys.path.append(str(current_dir.parent / "src"))
+sys.path.append(str(current_dir.parent.parent / "src"))
 
 USE_WRAPPER = os.environ.get("USE_WRAPPER", "0") == "1"
 if USE_WRAPPER:
@@ -21,22 +21,24 @@ else:
     logger_name = "Std_Mission"
 
 TOTAL_MESSAGES=0
-WAYPOINTS_FILENAME="/app/missions/patrol.waypoints"
+WAYPOINTS_FILENAME = os.environ.get("WAYPOINTS_FILE", "/app/missions/simple_patrol/patrol.waypoints")
 # Mission Config
 ALT_TARGET = float(os.environ.get("TARGET_ALT", 15.0))
 LAPS_TOTAL = int(os.environ.get("TOTAL_LAPS", 3))
-BATT_CRIT  = float(os.environ.get("BATT_LIMIT", 60.0))
+BATT_CRIT  = float(os.environ.get("BATT_CRIT", 60.0))
 CONN_STR   = os.environ.get("CONNECTION_STR", 'udpin:0.0.0.0:14551')
 SPEED_MPS  = float(os.environ.get("SPEED", 5.0))
 
 # Fail injection logic
 FAIL_ENABLE = os.environ.get("FAIL_ENABLE", "0") == "1"
-FAIL_PHASE  = os.environ.get("FAIL_PHASE", "")
+# FAIL_PHASE  = os.environ.get("FAIL_PHASE", "")
+FAIL_PHASES  = [p.strip().upper() for p in os.environ.get("FAIL_PHASE", "").split(",") if p.strip()]
 FAIL_LAP    = int(os.environ.get("FAIL_LAP", "1"))   # 1-based
 FAIL_WP     = int(os.environ.get("FAIL_WP", "2"))    # 1-based
 
 # Mission Logging Setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(logger_name)
 BASE_DIR = os.environ.get("CHECKPOINT_BASEDIR", "/mnt/checkpoints")
 LOG_DIR = f"{BASE_DIR}/mission_logs"
@@ -47,6 +49,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 if FAIL_ENABLE:
     print(f"Mission program started with fail injection at lap {FAIL_LAP} and waypoint {FAIL_WP}")
 
+'''
 def maybe_fail(phase, lap=None, wp=None):
     crash_file = os.path.join(LOG_DIR, "last_crash.json")
 
@@ -63,7 +66,30 @@ def maybe_fail(phase, lap=None, wp=None):
 
         logger.error(f"FAIL-INJECT: Triggered at {phase}\n")
         os._exit(137)
+'''
 
+def maybe_fail(phase, lap=None, wp=None):
+    if not FAIL_ENABLE:
+        return
+
+    phase_upper = phase.upper()
+    if phase_upper not in FAIL_PHASES:
+        return
+
+    # One crash file per phase — independent tracking
+    crash_file = os.path.join(LOG_DIR, f"last_crash_{phase_upper}.json")
+
+    # Already crashed at this phase before — skip
+    if os.path.exists(crash_file):
+        return
+
+    # Record and die
+    with open(crash_file, "w") as f:
+        f.write(f'{{"phase": "{phase}", "lap": {lap}, "wp": {wp}}}')
+
+    logger.error(f"FAIL-INJECT: Triggered at {phase}\n")
+    os._exit(137)
+    
 def log_metric(event, active_sysid=None, lap=None, wp=None, extra=""):
     pass
     # with open(MISSION_LOGFILE, "a") as f:
@@ -75,7 +101,7 @@ def log_metric(event, active_sysid=None, lap=None, wp=None, extra=""):
 def fetch_position(conn, sysid):
     """Filters stream for specific System ID and reports status."""
     global TOTAL_MESSAGES
-    logger.info(f"[{sysid}] Syncing GPS position...")
+    # logger.info(f"[{sysid}] Syncing GPS position...")
     while True:
         msg = conn.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
         TOTAL_MESSAGES += 1
@@ -88,16 +114,17 @@ def track_arrival(conn, sysid, t_lat, t_lon, tolerance=1.5):
     Prints distance remaining to show the system is 'alive'.
     """
     global TOTAL_MESSAGES
-    logger.info(f"[{sysid}] Moving to target... (Waiting for arrival)")
+    # logger.info(f"[{sysid}] Moving to target... (Waiting for arrival)")
     # last_print = time.time()
     count = 0
     
     while True:
         msg = conn.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
         TOTAL_MESSAGES += 1
-        count += 1
+        
         # Filter: Only process data from the active drone
         if msg and msg.get_srcSystem() == sysid:
+            count += 1
             c_lat, c_lon = msg.lat / 1e7, msg.lon / 1e7
             dist = math.sqrt(((t_lat - c_lat) * 111319.5)**2 + ((t_lon - c_lon) * 111319.5)**2)
             
@@ -106,7 +133,7 @@ def track_arrival(conn, sysid, t_lat, t_lon, tolerance=1.5):
                 logger.info(f"   ... Distance to WP: {dist:.1f}m")
 
             if dist < tolerance: 
-                logger.info(f"[{sysid}] >> ARRIVED at Waypoint (Dist: {dist:.2f}m)")
+                # logger.info(f"[{sysid}] >> ARRIVED at Waypoint (Dist: {dist:.2f}m)")
                 return
 
 def wait_veh_time(conn, sysid, seconds):
@@ -174,7 +201,7 @@ class RelayController:
         #     0, 
         #     mavutil.mavlink.MAV_PARAM_TYPE_INT32
         # )
-        self.wait_for_ekf_gps(1)
+        # self.wait_for_ekf_gps(1)
         # self.wait_for_ekf_gps(2)
         # log_metric("INIT_COMMS", extra="both_systems_detected")
         logger.info("--- SYSTEM READY ---")
@@ -214,16 +241,16 @@ class RelayController:
         
         self.master.mav.command_long_send(sysid, 1, 176, 0, 1, 4, 0, 0, 0, 0, 0) # Mode
         log_metric("MODE_GUIDED_SENT", active_sysid=sysid)
-        logger.info(f"{tag} Mode -> GUIDED")
+        # logger.info(f"{tag} Mode -> GUIDED")
         
         self.master.mav.command_long_send(sysid, 1, 400, 0, 1, 0, 0, 0, 0, 0, 0) # Arm
         log_metric("ARM_SENT", active_sysid=sysid)
-        logger.info(f"{tag} Arming Motors...")
+        # logger.info(f"{tag} Arming Motors...")
         
         self.master.mav.command_long_send(sysid, 1, 22, 0, 0, 0, 0, 0, 0, 0, ALT_TARGET) # Takeoff
         log_metric("TAKEOFF_SENT", active_sysid=sysid, extra=f"alt={ALT_TARGET}")
-        logger.info(f"{tag} Takeoff Command Sent. Climbing to {ALT_TARGET}m...")
-        
+        # logger.info(f"{tag} Takeoff Command Sent. Climbing to {ALT_TARGET}m...")
+        logger.info(f"{tag} GUIDED mode set - arming and climbing to {ALT_TARGET}m...")
         # Wait for altitude using the ID filter
         while True:
             msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
@@ -241,7 +268,8 @@ class RelayController:
         new_id = self.backup_sysid
         
         print("\n" + "="*50)
-        logger.warning(f"HANDOVER TRIGGERED: RETIRING UAV {old_id}")
+        # logger.warning(f"HANDOVER TRIGGERED: RETIRING UAV {old_id}")
+        logger.warning(f"HANDOVER TRIGGERED: RETIRING UAV {old_id} -> UAV {new_id}")
         print("="*50 + "\n")
 
         
@@ -253,19 +281,20 @@ class RelayController:
         log_metric("UAV1_RTL_SENT", active_sysid=old_id)
         maybe_fail("AFTER_RTL")
 
-        logger.info(f"[{old_id}] Waiting for landing & disarm...")
-        while True:
-            msg = self.master.recv_match(type='HEARTBEAT', blocking=True)
-            TOTAL_MESSAGES += 1
-            if msg and msg.get_srcSystem() == old_id:
-                if not (msg.base_mode & 128): 
-                    logger.info(f"[{old_id}] DISARM CONFIRMED.")
-                    break 
+        # logger.info(f"[{old_id}] Waiting for landing & disarm...")
+        # while True:
+        #     msg = self.master.recv_match(type='HEARTBEAT', blocking=True)
+        #     TOTAL_MESSAGES += 1
+        #     if msg and msg.get_srcSystem() == old_id:
+        #         if not (msg.base_mode & 128): 
+        #             logger.info(f"[{old_id}] DISARM CONFIRMED.")
+        #             break 
         
-        log_metric("UAV1_DISARM_CONFIRMED", active_sysid=old_id)
+        # log_metric("UAV1_DISARM_CONFIRMED", active_sysid=old_id)
         
         print("\n" + "-"*30)
-        logger.info(f"ACTIVATING UAV {new_id}")
+        # logger.info(f"ACTIVATING UAV {new_id}")
+        logger.info(f"ACTIVATING UAV {new_id} - taking over mission")
         print("-"*30 + "\n")
         log_metric("UAV2_TAKEOFF_START", active_sysid=new_id)
         # Launch Backup
@@ -347,6 +376,8 @@ def main():
 
             #Arrival + loiter
             track_arrival(ctrl.master, ctrl.active_sysid, wp_lat, wp_lon)
+            logger.info(f"[{ctrl.active_sysid}] ARRIVED WP {wp_idx}/{len(wps)} — Lap {lap_idx}/{LAPS_TOTAL}")
+
             log_metric("ARRIVED", active_sysid=ctrl.active_sysid, lap=lap_idx, wp=wp_idx)
 
             log_metric("LOITER_START", active_sysid=ctrl.active_sysid, lap=lap_idx, wp=wp_idx, extra="sec=5")
@@ -355,7 +386,10 @@ def main():
         
         log_metric("LAP_END", active_sysid=ctrl.active_sysid, lap=lap + 1)
 
-    logger.info("MISSION COMPLETE. Sending RTL to final vehicle.")
+    # logger.info("MISSION COMPLETE. Sending RTL to final vehicle.")
+    # logger.info(f"{'='*50}")
+    logger.info(f"MISSION COMPLETE — {LAPS_TOTAL} laps flown — RTL sent to UAV {ctrl.active_sysid}")
+    # logger.info(f"{'='*50}")
     log_metric("MISSION_COMPLETE", active_sysid=ctrl.active_sysid)
 
     ctrl.master.mav.command_long_send(ctrl.active_sysid, 1, 20, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -363,6 +397,8 @@ def main():
     # logger.info(f"Total Messages Received: {TOTAL_MESSAGES}")
 
     ctrl.master.close()
+    logger.info("Mission program exiting cleanly.")
+
 
     
 

@@ -9,8 +9,8 @@ import sys
 import sysv_ipc
 
 # --- Configuration ---
-COMMAND = os.environ.get("COMMAND", "python3 /app/surveillance_mission.py")
-APP_NAME = os.environ.get("APP_NAME", "surveillance_mission.py")
+COMMAND = os.environ.get("COMMAND", "")
+APP_NAME = os.environ.get("APP_NAME", "")
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", 120))
 CHECKPOINT = int(os.environ.get("CHECKPOINT", "1"))
 
@@ -20,6 +20,13 @@ LOGFILES_DIR = f"{CHECKPOINT_BASEDIR}/logfiles"
 RECV_LOG_PATH = f"{CHECKPOINT_BASEDIR}/logfiles/recv.bin"
 SEND_LOG_PATH = f"{CHECKPOINT_BASEDIR}/logfiles/send.bin"
 # ---------------------
+
+# Debug colouring
+SUPERVISOR = "\033[93m" # Bright yellow 
+RESET   = "\033[0m"
+
+def supervisor_print(msg):
+    print(f"{SUPERVISOR}[Supervisor] {msg}{RESET}")
 
 def fix_permissions(directory):
     # Retrieve the Host User IDs passed in via 'docker run -e ...'
@@ -48,7 +55,8 @@ class Supervisor:
         chkpt_path = pathlib.Path(CHECKPOINT_DIR) # Add this line
         if CHECKPOINT and any(chkpt_path.iterdir()):
             # Restore mission program
-            print("\n\n\n[Supervisor]: Found existing checkpoint. Restoring...")
+            # print("\n\n\n[Supervisor]: Found existing checkpoint. Restoring...")
+            supervisor_print("Found existing checkpoint. Restoring...")
             
             restore_cmd = [
                 "criu", "restore",
@@ -70,8 +78,8 @@ class Supervisor:
 
         else:
             # Fresh start
-            print(f"[Supervisor]: Starting fresh process: {COMMAND}")
-
+            # print(f"[Supervisor]: Starting fresh process: {COMMAND}")
+            supervisor_print(f"Starting fresh process: {COMMAND}")    
             #Reserve PID space to avoid confilcts at low pids
             for _ in range(300): subprocess.run(["true"], check=False)
             
@@ -84,7 +92,8 @@ class Supervisor:
 
     def _perform_checkpoint(self):
         self.sem.acquire()
-        print(f"[Supervisor] Snapshotting PID {self.app_pid}...")
+        # print(f"[Supervisor] Snapshotting PID {self.app_pid}...")
+        supervisor_print(f"Snapshotting PID {self.app_pid}...")
         try:
             subprocess.run(["criu", "dump", "-t", str(self.app_pid), "-D", CHECKPOINT_DIR, 
                             "--shell-job", "--leave-running", "--tcp-close", 
@@ -92,9 +101,11 @@ class Supervisor:
             
             self.rotate_logs()
             fix_permissions(CHECKPOINT_BASEDIR)
-            print("[Supervisor] Snapshot SUCCESS.")
+            # print("[Supervisor] Snapshot SUCCESS.")
+            supervisor_print("Snapshot SUCCESS.")
         except Exception as e:
-            print(f"[Supervisor] Snapshot FAILED: {e}")
+            # print(f"[Supervisor] Snapshot FAILED: {e}")
+            supervisor_print(f"Snapshot FAILED: {e}")
         finally:
             self.sem.release()
 
@@ -116,7 +127,8 @@ class Supervisor:
                 with open(path, 'wb') as f:
                     os.fsync(f.fileno()) # Ensure the directory entry is committed
             except OSError as e:
-                print(f"[Supervisor] Rotation failed for {path}: {e}")
+                # print(f"[Supervisor] Rotation failed for {path}: {e}")
+                supervisor_print(f"Rotation failed for {path}: {e}")
     
     def run(self):
         """Main lifecycle controller."""
@@ -124,26 +136,35 @@ class Supervisor:
         flag_path = os.path.join(f"{CHECKPOINT_BASEDIR}/mission_logs", "mission_completed.flag")
 
         while True:
+            print("Try to init")
             if not self._initialize_mission():
-                print("[Supervisor] Fatal: Mission failed to start/restore.")
+                # print("[Supervisor] Fatal: Mission failed to start/restore.")
+                supervisor_print("Fatal: Mission failed to start/restore.")
                 sys.exit(1)
 
-            print(f"[Supervisor] Monitoring PID {self.app_pid}...")
+            # print(f"[Supervisor] Monitoring PID {self.app_pid}...")
+            supervisor_print(f"Monitoring PID {self.app_pid}...")
             
             try:
                 while True:
+                    restart_needed = False
                     # Watchdog & Sleep
                     elapsed = 0
                     while elapsed < CHECKPOINT_INTERVAL:
                         if self.get_pid_by_name() is None:
                             if os.path.exists(flag_path):
-                                print("[Supervisor] Mission completed. Exiting.")
+                                # print("[Supervisor] Mission completed. Exiting.")
+                                supervisor_print("Mission completed. Exiting.")
                                 return
                             else:
-                                os._exit(137)
+                                print("Restart!")
+                                restart_needed = True
+                                break
+                                # os._exit(137)
                         time.sleep(2)
                         elapsed += 2
-
+                    if restart_needed:
+                        break
                     if CHECKPOINT:
                         self._perform_checkpoint()
 
@@ -159,7 +180,8 @@ class Supervisor:
             except: pass
         try: self.sem.remove()
         except: pass
-        print("[Supervisor] Cleanup complete.")
+        # print("[Supervisor] Cleanup complete.")
+        supervisor_print("[Supervisor] Cleanup complete.")
         
 if __name__ == "__main__":
     Supervisor().run()

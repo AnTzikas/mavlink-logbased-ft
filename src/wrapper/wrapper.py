@@ -12,6 +12,12 @@ from wrapper import replay_buffer
 from wrapper.replay_buffer import ReplayBuffer
 from wrapper.ipc_sem import IPCClient
 
+#output colouring
+WRAPPER  = "\033[91m" 
+RESET   = "\033[0m"
+
+def wrapper_print(msg):
+    print(f"{WRAPPER}[Wrapper] {msg}{RESET}")
 
 # Proxy class for intercepting outgoing commands (e.g., master.mav.command_long_send)
 class _MavSenderProxy:
@@ -211,7 +217,7 @@ class MavlinkWrapper:
                 f.write(f"Completed at {time.ctime()}")
             # print(f"Flag file created at {flag_path}")
         except Exception as e:
-            print(f"[Wrapper] Failed to create flag file: {e}")
+            wrapper_print(f"Failed to create flag file: {e}")
     
     @property
     def is_replay_mode(self) -> bool:
@@ -289,7 +295,7 @@ class MavlinkWrapper:
         self._extend_replay_buffer('send', new_send_buf)
         
         self._is_replay_mode = True
-        print("\n\n[Wrapper] Enter Replay Mode!\n")
+        wrapper_print("Enter Replay Mode!\n")
 
         return True
 
@@ -319,8 +325,11 @@ class MavlinkWrapper:
     def _handle_replay_receive(self):
         
         if self._recv_buffer is None or self._recv_buffer.is_exhausted:
-            print("\n[Wrapper] Replay buffer exhausted. Transitioning to LIVE MODE.\n\n")
-            self._is_replay_mode = False
+            
+            # todo
+            self.exit_replay_mode() 
+            # wrapper_print("Replay buffer exhausted. Transitioning to LIVE MODE.")
+            # self._is_replay_mode = False
             return None # Return None to allow loop to retry in live mode
         
         entry = self._recv_buffer.next_entry()
@@ -330,12 +339,21 @@ class MavlinkWrapper:
     def _handle_replay_send(self, summary):
         
         if self._send_buffer is None or self._send_buffer.is_exhausted:
+            self.exit_replay_mode()
             # print("[Wrapper] Replay buffer exhausted. Transitioning to LIVE MODE.")
             # self._is_replay_mode = False
             return None
         entry = self._send_buffer.next_entry()
         return entry
     
+    def exit_replay_mode(self):
+        recv_done = self._recv_buffer is None or self._recv_buffer.is_exhausted
+        send_done = self._send_buffer is None or self._send_buffer.is_exhausted
+
+        if recv_done and send_done:
+            wrapper_print("Replay buffer exhausted. Transitioning to LIVE MODE.")
+            self._is_replay_mode = False
+
     """Formats and writes a receive entry to disk."""
     def _log_receive_interaction(self, msg, api_id):
         
