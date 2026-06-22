@@ -1,4 +1,6 @@
 import argparse
+import math
+import os
 import re
 import sys
 import time
@@ -9,6 +11,8 @@ from typing import Deque, List, Optional, Sequence, Tuple
 from pymavlink import mavutil
 
 from drone import Drone, Waypoint, MAVLinkDispatcher
+from mavftp import FtpClient, FtpError
+from detector import Detector
 
 
 MISSION_CMD_NAV_WAYPOINT         = 16
@@ -18,6 +22,8 @@ MISSION_CMD_NAV_RETURN_TO_LAUNCH = 20
 MISSION_CMD_NAV_LAND             = 21
 MISSION_CMD_NAV_TAKEOFF          = 22
 MISSION_CMD_NAV_SPLINE_WAYPOINT  = 82
+
+INSPECT_DIRECTIONS = ["south", "east", "north", "west"]
 
 
 @dataclass
@@ -35,6 +41,11 @@ class DroneCommand:
     label: str
     waypoint: Optional[MissionWaypoint] = None
     home_target: Optional[Waypoint] = None
+    target_point: Optional[Waypoint] = None     # for goto_side
+    direction: Optional[str] = None             # for goto_side / capture_side
+    bearing_deg: Optional[float] = None         # for capture_side
+    pitch_deg: Optional[float] = None           # for capture_side
+    request_id: Optional[int] = None            # for inspect_nadir / capture_side
     altitude: Optional[float] = None
     timeout_s: float = 60.0
     tolerance_m: float = 2.0
@@ -58,6 +69,15 @@ class DroneRuntime:
     completed_waypoints: int = 0
     failed: bool = False
     failure_reason: Optional[str] = None
+    ftp: Optional["FtpClient"] = None   # set in connect_all(), used for capture downloads
+
+    # --- inspection state, reset at the start of each waypoint's inspection ---
+    anomaly_class_id: Optional[int] = None
+    anomaly_class_name: Optional[str] = None
+    anomaly_confidence: Optional[float] = None
+    confirmations: List[tuple] = field(default_factory=list)
+    side_results: List[tuple] = field(default_factory=list)
+    inspect_sides_completed: int = 0
 
     def active_command(self) -> Optional[DroneCommand]:
         if 0 <= self.command_index < len(self.command_queue):
@@ -73,6 +93,14 @@ class DroneRuntime:
         self.command_queue     = []
         self.command_index     = 0
 
+    def reset_inspection_state(self) -> None:
+        self.anomaly_class_id      = None
+        self.anomaly_class_name    = None
+        self.anomaly_confidence    = None
+        self.confirmations         = []
+        self.side_results          = []
+        self.inspect_sides_completed = 0
+
 
 def haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     from math import atan2, cos, radians, sin, sqrt
@@ -83,6 +111,41 @@ def haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> 
     dlambda = radians(lon2 - lon1)
     a = sin(dphi / 2.0) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2.0) ** 2
     return R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a))
+
+
+def offset_position(lat: float, lon: float, direction: str, distance_m: float) -> Tuple[float, float]:
+    """Returns (lat, lon) offset from the given point by distance_m in the
+    given compass direction (north/south/east/west)."""
+    lat_scale = 111195.0
+    lon_scale = 111195.0 * math.cos(math.radians(lat))
+
+    if direction == "north":
+        return lat + distance_m / lat_scale, lon
+    if direction == "south":
+        return lat - distance_m / lat_scale, lon
+    if direction == "east":
+        return lat, lon + distance_m / lon_scale
+    if direction == "west":
+        return lat, lon - distance_m / lon_scale
+    raise ValueError("Unknown direction: {0}".format(direction))
+
+
+def absolute_bearing_toward_target(direction: str) -> float:
+    """Standard compass bearing FROM a hover position offset in `direction`
+    TOWARD the target it was offset from (0=North, 90=East, 180=South, 270=West)."""
+    return {
+        "south": 0.0,
+        "north": 180.0,
+        "east":  270.0,
+        "west":  90.0,
+    }[direction]
+
+
+def yaw_relative_to_heading(absolute_bearing_deg: float, vehicle_heading_deg: float) -> float:
+    """Converts a desired absolute compass bearing into the yaw value to
+    send to point_gimbal(), correcting for the vehicle's actual current
+    heading. Result is normalized to -180..180."""
+    return (absolute_bearing_deg - vehicle_heading_deg + 180.0) % 360.0 - 180.0
 
 
 def parse_mission_file(mission_path: str) -> Tuple[List[MissionWaypoint], Optional[float], List[int]]:
@@ -160,6 +223,12 @@ class MissionController:
         battery_threshold_pct: int = 20,
         charge_delay_s: float = 60.0,
         discovery_timeout_s: float = 10.0,
+        capture_settle_s: float = 2.0,
+        capture_dir: str = "captures",
+        confirm_alt_m: float = 5.0,
+        confirm_offset_m: float = 5.0,
+        anomaly_threshold: float = 0.15,
+        confirm_threshold: float = 0.6,
     ) -> None:
         self.connection_string     = connection_string
         self.dispatcher: Optional[MAVLinkDispatcher] = None
@@ -176,10 +245,23 @@ class MissionController:
         self.battery_threshold_pct = battery_threshold_pct
         self.charge_delay_s        = charge_delay_s
         self.discovery_timeout_s   = discovery_timeout_s
+        self.capture_settle_s      = capture_settle_s
+        self.confirm_alt_m         = confirm_alt_m
+        self.confirm_offset_m      = confirm_offset_m
+        self.anomaly_threshold     = anomaly_threshold
+        self.confirm_threshold     = confirm_threshold
         self.drones: List[DroneRuntime] = []
         self.total_waypoints       = len(route_waypoints)
         self.finished_waypoints    = 0
         self.last_status_at        = 0.0
+        self.capture_dir           = capture_dir   # local dir for FTP-downloaded captures
+        self._request_id_counter   = 0
+        print("[DETECTOR] Loading YOLO model (this may take a moment)...")
+        self.detector = Detector()
+
+    def _next_request_id(self) -> int:
+        self._request_id_counter += 1
+        return self._request_id_counter
 
     # -----------------------------------------------------------------------
     # Startup
@@ -217,9 +299,10 @@ class MissionController:
                 home=home,
                 takeoff_alt_m=self.takeoff_alt_m,
                 airspeed_m_s=self.airspeed_m_s,
+                ftp=FtpClient(self.dispatcher._conn, target_system=sysid, target_component=1),
             )
             self.drones.append(runtime)
-            print("[READY] {0} sysid={1} home=({2:.7f}, {3:.7f})".format(
+            print("[READY] {0} sysid={1} home=({2:.5f}, {3:.5f})".format(
                 name, sysid, home.lat, home.lon))
 
     def _resolve_home(self, drone: Drone) -> Waypoint:
@@ -268,7 +351,7 @@ class MissionController:
                 pass
 
     # -----------------------------------------------------------------------
-    # Waypoint assignment — one at a time, only for idle (grounded) drones
+    # Waypoint assignment -- one at a time, only for idle (grounded) drones
     # -----------------------------------------------------------------------
 
     def _assign_waypoints_to_idle_drones(self) -> None:
@@ -280,17 +363,20 @@ class MissionController:
 
             waypoint = self.pending_waypoints.popleft()
             runtime.assigned_waypoint = waypoint
+            runtime.reset_inspection_state()
             runtime.command_queue     = self._build_command_queue(runtime, waypoint)
             runtime.command_index     = 0
             runtime.phase             = "ASSIGNED"
-            print("[ASSIGN] {0} <- WP#{1} ({2:.7f}, {3:.7f})".format(
+            print("[ASSIGN] {0} <- WP#{1} ({2:.5f}, {3:.5f})".format(
                 runtime.name, waypoint.source_index, waypoint.lat, waypoint.lon))
 
     def _build_command_queue(self, runtime: DroneRuntime, waypoint: MissionWaypoint) -> List[DroneCommand]:
         """
-        Builds ARM → TAKEOFF → GOTO → RETURN HOME.
-        LAND / DISARM are NOT added here — they are inserted dynamically
-        by _decide_after_return_home() based on battery level.
+        Builds ARM -> TAKEOFF -> GOTO -> INSPECT_NADIR -> RETURN HOME.
+        LAND / DISARM are NOT added here -- inserted dynamically by
+        _decide_after_return_home(). Stage-2 inspect_side commands are
+        ALSO inserted dynamically, right after INSPECT_NADIR, only if
+        an anomaly is found there.
         """
         return [
             DroneCommand(kind="arm",    label="ARM",    timeout_s=30.0, tolerance_m=0.0),
@@ -309,6 +395,12 @@ class MissionController:
                 tolerance_m=self.waypoint_tolerance_m,
             ),
             DroneCommand(
+                kind="inspect_nadir",
+                label="INSPECT NADIR WP#{0}".format(waypoint.source_index),
+                waypoint=waypoint,
+                timeout_s=self.capture_settle_s + 10.0,
+            ),
+            DroneCommand(
                 kind="goto_home",
                 label="RETURN HOME",
                 home_target=runtime.home,
@@ -319,10 +411,8 @@ class MissionController:
         ]
 
     def _build_next_waypoint_commands(self, runtime: DroneRuntime, waypoint: MissionWaypoint) -> List[DroneCommand]:
-        """
-        Command queue when drone is already in the air and battery is ok.
-        No ARM or TAKEOFF needed.
-        """
+        """Command queue when drone is already in the air and battery is ok.
+        No ARM or TAKEOFF needed."""
         return [
             DroneCommand(
                 kind="goto",
@@ -330,6 +420,12 @@ class MissionController:
                 waypoint=waypoint,
                 timeout_s=self.no_progress_timeout_s,
                 tolerance_m=self.waypoint_tolerance_m,
+            ),
+            DroneCommand(
+                kind="inspect_nadir",
+                label="INSPECT NADIR WP#{0}".format(waypoint.source_index),
+                waypoint=waypoint,
+                timeout_s=self.capture_settle_s + 10.0,
             ),
             DroneCommand(
                 kind="goto_home",
@@ -341,16 +437,49 @@ class MissionController:
             ),
         ]
 
+    def _build_inspect_side_commands(self, runtime: DroneRuntime, waypoint: MissionWaypoint) -> List[DroneCommand]:
+        """Builds the 8 dynamically-inserted Stage 2 commands: for each of
+        the 4 directions, a goto_side followed by a capture_side."""
+        aim_angle_deg = -math.degrees(
+            math.atan2(self.confirm_alt_m, self.confirm_offset_m)
+        )
+        commands: List[DroneCommand] = []
+        for direction in INSPECT_DIRECTIONS:
+            hover_lat, hover_lon = offset_position(
+                waypoint.lat, waypoint.lon, direction, self.confirm_offset_m
+            )
+            bearing = absolute_bearing_toward_target(direction)
+            commands.append(
+                DroneCommand(
+                    kind="goto_side",
+                    label="GOTO SIDE {0} WP#{1}".format(direction, waypoint.source_index),
+                    waypoint=waypoint,
+                    direction=direction,
+                    target_point=Waypoint(hover_lat, hover_lon, self.confirm_alt_m),
+                    timeout_s=self.no_progress_timeout_s,
+                    tolerance_m=self.waypoint_tolerance_m,
+                )
+            )
+            commands.append(
+                DroneCommand(
+                    kind="capture_side",
+                    label="CAPTURE SIDE {0} WP#{1}".format(direction, waypoint.source_index),
+                    waypoint=waypoint,
+                    direction=direction,
+                    bearing_deg=bearing,
+                    pitch_deg=aim_angle_deg,
+                    timeout_s=self.capture_settle_s + 10.0,
+                )
+            )
+        return commands
+
     def _decide_after_return_home(self, runtime: DroneRuntime) -> None:
-        """
-        Called when RETURN HOME completes. Drone is hovering above home.
-        Decides what to do next based on battery level and pending waypoints.
-        """
+        """Called when RETURN HOME completes. Drone is hovering above home.
+        Decides what to do next based on battery level and pending waypoints."""
         battery = runtime.drone.get_battery_remaining()
         insert_pos = runtime.command_index + 1
 
         if battery < self.battery_threshold_pct:
-            # Battery low: land, disarm, simulate charge, become idle
             print("[BATTERY] {0} battery low ({1}%). Landing to recharge.".format(
                 runtime.name, battery))
             runtime.command_queue[insert_pos:] = [
@@ -358,19 +487,17 @@ class MissionController:
                 DroneCommand(kind="disarm",       label="DISARM",      timeout_s=30.0,  tolerance_m=0.0),
                 DroneCommand(kind="charge_wait",  label="CHARGING",    timeout_s=self.charge_delay_s + 10.0),
             ]
-            # Clear assigned waypoint so after charge the drone gets fresh assignment
             runtime.assigned_waypoint = None
 
         elif self.pending_waypoints:
-            # Battery ok and more work to do: go directly to next waypoint
             waypoint = self.pending_waypoints.popleft()
             runtime.assigned_waypoint = waypoint
+            runtime.reset_inspection_state()
             print("[ASSIGN] {0} <- WP#{1} (in air, battery {2}%)".format(
                 runtime.name, waypoint.source_index, battery))
             runtime.command_queue[insert_pos:] = self._build_next_waypoint_commands(runtime, waypoint)
 
         else:
-            # Battery ok but no more waypoints: land and disarm cleanly
             print("[BATTERY] {0} battery ok ({1}%) but no more waypoints. Landing.".format(
                 runtime.name, battery))
             runtime.command_queue[insert_pos:] = [
@@ -389,7 +516,6 @@ class MissionController:
 
         command = runtime.active_command()
         if command is None:
-            # Command queue exhausted — drone is on the ground and idle
             runtime.reset()
             return
 
@@ -399,7 +525,6 @@ class MissionController:
 
         if self._is_command_complete(runtime, command):
 
-            # Count waypoint as finished when GOTO completes
             if command.kind == "goto" and runtime.assigned_waypoint is not None:
                 self.finished_waypoints += 1
                 print("[COMPLETE] {0} visited WP#{1} ({2}/{3})".format(
@@ -410,7 +535,12 @@ class MissionController:
                 ))
                 runtime.completed_waypoints += 1
 
-            # When RETURN HOME completes, decide what comes next
+            if command.kind == "inspect_nadir":
+                self._handle_inspect_nadir_complete(runtime, command)
+
+            if command.kind == "capture_side":
+                self._handle_capture_side_complete(runtime, command)
+
             if command.kind == "goto_home":
                 self._decide_after_return_home(runtime)
 
@@ -420,6 +550,94 @@ class MissionController:
             return
 
         self._check_progress(runtime, command)
+
+    # -----------------------------------------------------------------------
+    # Inspection result handling
+    # -----------------------------------------------------------------------
+
+    def _handle_inspect_nadir_complete(self, runtime: DroneRuntime, command: DroneCommand) -> None:
+        """Stage 1 complete: run anomaly detection on the captured nadir
+        frame. If an anomaly is found, dynamically insert the Stage 2
+        (4-side) inspection commands right after this one."""
+        image_path = getattr(command, "_captured_image", None)
+        wp_label = "WP#{0}".format(command.waypoint.source_index)
+        if image_path is None:
+            print("[INSPECT] {0}: capture failed, skipping inspection.".format(wp_label))
+            return
+
+        anomaly = self.detector.detect_anomaly(image_path, threshold=self.anomaly_threshold)
+        if anomaly is None:
+            print("[INSPECT] {0}: empty.".format(wp_label))
+            return
+
+        class_id, class_name, conf = anomaly
+        runtime.anomaly_class_id   = class_id
+        runtime.anomaly_class_name = class_name
+        runtime.anomaly_confidence = conf
+        print("[INSPECT] {0}: anomaly ({1}, conf={2:.2f}) -- checking 4 sides.".format(
+            wp_label, class_name, conf))
+
+        side_commands = self._build_inspect_side_commands(runtime, command.waypoint)
+        insert_pos = runtime.command_index + 1
+        runtime.command_queue[insert_pos:insert_pos] = side_commands
+
+    def _handle_capture_side_complete(self, runtime: DroneRuntime, command: DroneCommand) -> None:
+        """One Stage 2 side complete: run detection, accumulate results.
+        When all 4 sides are done, print the final summary."""
+        image_path = getattr(command, "_captured_image", None)
+        direction = command.direction
+
+        if image_path is None:
+            runtime.side_results.append((direction, None, None))
+        else:
+            all_detections = self.detector.detect_all(image_path, min_conf=0.05)
+
+            same_class_conf = None
+            best_overall = None
+            for det_class_id, det_name, det_conf in all_detections:
+                if det_class_id == runtime.anomaly_class_id and same_class_conf is None:
+                    same_class_conf = det_conf
+                if best_overall is None or det_conf > best_overall[2]:
+                    best_overall = (det_class_id, det_name, det_conf)
+
+            runtime.side_results.append((direction, same_class_conf, best_overall))
+
+            match_conf = same_class_conf
+            match_name = runtime.anomaly_class_name
+            match_id   = runtime.anomaly_class_id
+            if (match_conf is None or match_conf < self.confirm_threshold) and best_overall is not None:
+                if best_overall[2] >= self.confirm_threshold:
+                    match_conf = best_overall[2]
+                    match_name = best_overall[1]
+                    match_id   = best_overall[0]
+
+            if match_conf is not None and match_conf >= self.confirm_threshold:
+                runtime.confirmations.append((direction, match_conf, match_name, match_id))
+                # No per-side print here -- the summary table below covers
+                # every side in one place once all 4 are done.
+
+        runtime.inspect_sides_completed += 1
+
+        if runtime.inspect_sides_completed >= len(INSPECT_DIRECTIONS):
+            self._print_inspection_summary(runtime, command.waypoint)
+
+    def _print_inspection_summary(self, runtime: DroneRuntime, waypoint: MissionWaypoint) -> None:
+        print("\n[INSPECT] WP#{0} summary -- Stage 1: {1} (conf={2:.2f})".format(
+            waypoint.source_index, runtime.anomaly_class_name, runtime.anomaly_confidence))
+        for direction, same_class_conf, best_overall in runtime.side_results:
+            same_str  = "{0:.2f}".format(same_class_conf) if same_class_conf is not None else "-"
+            best_str  = "{0} {1:.2f}".format(best_overall[1], best_overall[2]) if best_overall else "none"
+            print("    {0:<6} same-class={1:<5} best={2}".format(direction, same_str, best_str))
+
+        if runtime.confirmations:
+            direction, conf, name, _id = max(runtime.confirmations, key=lambda c: c[1])
+            print("  -> CONFIRMED: {0} (conf={1:.2f}) from {2} side.\n".format(name, conf, direction))
+        else:
+            print("  -> UNCONFIRMED: anomaly seen at nadir but no side crossed the threshold.\n")
+
+    # -----------------------------------------------------------------------
+    # Command issuing
+    # -----------------------------------------------------------------------
 
     def _issue_command(self, runtime: DroneRuntime, command: DroneCommand) -> None:
         try:
@@ -433,12 +651,22 @@ class MissionController:
             elif command.kind == "goto_home":
                 h      = command.home_target
                 result = runtime.drone.goto_waypoint(h.lat, h.lon, command.altitude, runtime.airspeed_m_s)
+            elif command.kind == "goto_side":
+                tp     = command.target_point
+                result = runtime.drone.goto_waypoint(tp.lat, tp.lon, tp.alt, runtime.airspeed_m_s)
             elif command.kind == "land":
                 result = runtime.drone.land()
             elif command.kind == "disarm":
                 result = runtime.drone.disarm()
             elif command.kind == "charge_wait":
-                # No MAVLink command — just start the timer
+                result = "SUCCESS"
+            elif command.kind == "inspect_nadir":
+                runtime.drone.point_gimbal(pitch_deg=-90, yaw_deg=0)
+                result = "SUCCESS"
+            elif command.kind == "capture_side":
+                current_heading = runtime.drone.get_heading() or 0.0
+                yaw_to_send = yaw_relative_to_heading(command.bearing_deg, current_heading)
+                runtime.drone.point_gimbal(pitch_deg=command.pitch_deg, yaw_deg=yaw_to_send)
                 result = "SUCCESS"
             else:
                 raise RuntimeError("Unknown command kind: {0}".format(command.kind))
@@ -455,7 +683,11 @@ class MissionController:
         command.last_progress_at = command.issued_at
         command.best_metric      = self._remaining_metric(runtime, command)
         runtime.phase            = command.label
-        print("[COMMAND] {0}: {1}".format(runtime.name, command.label))
+        # Skip the per-command print for Stage 2 sub-steps -- the
+        # [INSPECT] summary already covers what happened on each side,
+        # so printing every goto_side/capture_side here is just noise.
+        if command.kind not in ("goto_side", "capture_side"):
+            print("[COMMAND] {0}: {1}".format(runtime.name, command.label))
 
     def _is_command_complete(self, runtime: DroneRuntime, command: DroneCommand) -> bool:
         try:
@@ -463,31 +695,103 @@ class MissionController:
                 return runtime.drone.is_armed()
             if command.kind == "takeoff":
                 return runtime.drone.get_altitude() >= (command.altitude - command.tolerance_m)
-            if command.kind in ("goto", "goto_home"):
+            if command.kind in ("goto", "goto_home", "goto_side"):
                 return runtime.drone.distance_to_target() <= command.tolerance_m
             if command.kind == "land":
                 return not runtime.drone.is_armed() or runtime.drone.get_altitude() <= command.tolerance_m
             if command.kind == "disarm":
                 return not runtime.drone.is_armed()
             if command.kind == "charge_wait":
-                # Complete when charge_delay_s has elapsed since issued
                 return (time.time() - command.issued_at) >= self.charge_delay_s
+            if command.kind in ("inspect_nadir", "capture_side"):
+                return self._poll_capture_command(runtime, command)
         except Exception as exc:
             self._mark_failed(runtime, "Completion check failed for {0}: {1}".format(command.label, exc))
             return False
         return False
 
+    def _poll_capture_command(self, runtime: DroneRuntime, command: DroneCommand) -> bool:
+        """
+        Drives an inspect_nadir / capture_side command through 3 phases:
+
+          1. Settle  -- wait capture_settle_s after the gimbal command
+                        was sent, so it has time to physically move
+                        before the camera actually captures anything.
+          2. Trigger -- send request_external_capture() exactly once,
+                        right when the settle period elapses.
+          3. Collect -- wait for the camera component's ACK, then
+                        download the file via MAVFTP. A separate
+                        ack-timeout applies here, since waiting for an
+                        ack is a different kind of wait than settling.
+
+        Returns True once the command is fully done (image downloaded,
+        OR conclusively failed/timed out -- either way we move on
+        rather than stalling the whole mission on one bad capture).
+        """
+        elapsed_since_issued = time.time() - command.issued_at
+
+        # Phase 1: settling
+        if elapsed_since_issued < self.capture_settle_s:
+            return False
+
+        # Phase 2: send the trigger exactly once, right as settling ends
+        if command.request_id is None:
+            command.request_id = self._next_request_id()
+            runtime.drone.request_external_capture(command.request_id)
+            command._trigger_sent_at = time.time()
+            return False
+
+        # Phase 3: already resolved in an earlier tick?
+        if hasattr(command, "_captured_image"):
+            return True
+
+        ack_result = runtime.drone.get_camera_ack(command.request_id)
+
+        if ack_result is None:
+            if time.time() - command._trigger_sent_at > 5.0:
+                print("[CAPTURE] {0}: no camera ack within 5s -- giving up.".format(command.label))
+                command._captured_image = None
+                return True
+            return False   # still waiting, within the ack timeout
+
+        if ack_result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            print("[CAPTURE] {0}: camera component returned failure (result={1}).".format(
+                command.label, ack_result))
+            command._captured_image = None
+            return True
+
+        # Ack accepted -- download the file via MAVFTP
+        wp_folder = "wp{0:02d}".format(command.waypoint.source_index)
+        local_dir = os.path.join(self.capture_dir, wp_folder)
+        os.makedirs(local_dir, exist_ok=True)
+        label = "nadir" if command.kind == "inspect_nadir" else "side_{0}".format(command.direction)
+        local_path  = os.path.join(local_dir, "{0}.jpg".format(label))
+        remote_path = "logs/capture_{0}.jpg".format(command.request_id)
+
+        try:
+            runtime.ftp.get_file(remote_path, local_path, timeout=10.0)
+            command._captured_image = local_path
+        except FtpError as exc:
+            print("[CAPTURE] {0}: FTP download failed: {1}".format(command.label, exc))
+            command._captured_image = None
+
+        return True
+
     def _remaining_metric(self, runtime: DroneRuntime, command: DroneCommand) -> Optional[float]:
         try:
             if command.kind == "takeoff":
                 return abs(command.altitude - runtime.drone.get_altitude())
-            if command.kind in ("goto", "goto_home"):
+            if command.kind in ("goto", "goto_home", "goto_side"):
                 return runtime.drone.distance_to_target()
             if command.kind == "land":
                 return runtime.drone.get_altitude()
             if command.kind == "charge_wait":
                 if command.issued_at is not None:
                     return max(0.0, self.charge_delay_s - (time.time() - command.issued_at))
+            # Note: inspect_nadir / capture_side have no entry here --
+            # _check_progress() skips them entirely (see below), since
+            # their timing (settle + trigger + ack-wait) is fully
+            # handled inside _poll_capture_command() instead.
         except Exception:
             return None
         return None
@@ -495,8 +799,7 @@ class MissionController:
     def _check_progress(self, runtime: DroneRuntime, command: DroneCommand) -> None:
         if command.issued_at is None:
             return
-        # charge_wait uses its own timer — no watchdog needed
-        if command.kind == "charge_wait":
+        if command.kind in ("charge_wait", "inspect_nadir", "capture_side"):
             return
         now = time.time()
         if now - command.issued_at > command.timeout_s and command.kind in ("arm", "disarm"):
@@ -571,7 +874,7 @@ class MissionController:
             pos     = runtime.drone.get_position()
             armed   = "ARMED" if runtime.drone.is_armed() else "DISARMED"
             battery = runtime.drone.get_battery_remaining()
-            line    = "  {0}: phase={1}, armed={2}, battery={3}%, pos=({4:.7f}, {5:.7f}, {6:.1f})".format(
+            line    = "  {0}: phase={1}, armed={2}, battery={3}%, pos=({4:.5f}, {5:.5f}, {6:.1f})".format(
                 runtime.name, runtime.phase, armed, battery,
                 pos.lat, pos.lon, pos.alt,
             )
@@ -588,7 +891,7 @@ class MissionController:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Multi-drone mission controller — one waypoint per trip."
+        description="Multi-drone mission controller with two-stage object inspection."
     )
     parser.add_argument("--connection",            required=True,             help="MAVLink connection string (e.g. udp:127.0.0.1:14553).")
     parser.add_argument("--mission",               required=True,             help="Path to QGC .waypoints file.")
@@ -604,6 +907,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-progress-timeout-s", type=float, default=45.0, help="No-progress failure threshold.")
     parser.add_argument("--battery-threshold",     type=int,   default=20,   help="Battery percentage below which drone lands to recharge.")
     parser.add_argument("--charge-delay-s",        type=float, default=60.0, help="Simulated recharge delay in seconds.")
+    parser.add_argument("--capture-settle-s",      type=float, default=2.0,  help="Seconds to let the gimbal settle before each capture.")
+    parser.add_argument("--capture-dir",           type=str,   default="captures", help="Local directory to save downloaded captures into (organized per-waypoint).")
+    parser.add_argument("--confirm-alt-m",         type=float, default=5.0,  help="Altitude for Stage 2 oblique confirmation.")
+    parser.add_argument("--confirm-offset-m",      type=float, default=5.0,  help="Horizontal offset from target during Stage 2.")
+    parser.add_argument("--anomaly-threshold",     type=float, default=0.15, help="Stage 1: minimum confidence to count as 'something detected'.")
+    parser.add_argument("--confirm-threshold",     type=float, default=0.6,  help="Stage 2: minimum confidence to count as confirmed.")
     return parser
 
 
@@ -633,6 +942,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         battery_threshold_pct=args.battery_threshold,
         charge_delay_s=args.charge_delay_s,
         discovery_timeout_s=args.discovery_timeout_s,
+        capture_settle_s=args.capture_settle_s,
+        capture_dir=args.capture_dir,
+        confirm_alt_m=args.confirm_alt_m,
+        confirm_offset_m=args.confirm_offset_m,
+        anomaly_threshold=args.anomaly_threshold,
+        confirm_threshold=args.confirm_threshold,
     )
 
     try:

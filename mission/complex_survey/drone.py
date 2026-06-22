@@ -7,6 +7,10 @@ COPTER_MODE_GUIDED = 4
 COPTER_MODE_RTL    = 6
 COPTER_MODE_LAND   = 9
 
+# Camera component identity -- see camera_component.py
+MAV_COMP_ID_CAMERA  = mavutil.mavlink.MAV_COMP_ID_CAMERA   # 100
+CAPTURE_COMMAND     = mavutil.mavlink.MAV_CMD_USER_1        # 31010
+
 
 class Waypoint:
     def __init__(self, lat: float, lon: float, alt: float):
@@ -84,9 +88,10 @@ class MAVLinkDispatcher:
         self, sysid: int, command,
         p1=0.0, p2=0.0, p3=0.0, p4=0.0,
         p5=0.0, p6=0.0, p7=0.0,
+        target_compid: int = 1,
     ) -> None:
         self._conn.mav.command_long_send(
-            sysid, 1, command, 0,
+            sysid, target_compid, command, 0,
             p1, p2, p3, p4, p5, p6, p7,
         )
 
@@ -140,6 +145,17 @@ class Drone:
         self._heartbeat_age = 0.0
         self._home: Waypoint | None = None
         self._battery_remaining: int = 100   # percent, updated by BATTERY_STATUS
+        self._heading_deg: float | None = None   # compass heading, from GLOBAL_POSITION_INT.hdg
+
+        # Camera ACK tracking. COMMAND_ACK carries no request_id of its
+        # own (it only has 'command' and 'result'), so we can't match
+        # an incoming ack to a specific request from the message alone.
+        # Since this architecture only ever has ONE outstanding capture
+        # request in flight at a time per drone, we just track the most
+        # recently sent request_id and the most recent ack result, and
+        # trust they correspond to each other.
+        self._pending_capture_request_id: int | None = None
+        self._camera_ack_result: int | None = None
 
         # --- flight state ---
         self._target_point: Waypoint | None = None
@@ -163,12 +179,30 @@ class Drone:
             self._lat     = msg.lat / 1e7
             self._lon     = msg.lon / 1e7
             self._alt_rel = msg.relative_alt / 1000.0
+            # hdg is compass heading in centidegrees, 0-35999, or
+            # 65535 if unknown/unavailable
+            if msg.hdg != 65535:
+                self._heading_deg = msg.hdg / 100.0
 
         elif t == "HEARTBEAT":
-            self._armed      = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-            self._custom_mode = msg.custom_mode
-            self._last_hb_at  = time.time()
-            self._heartbeat_age = 0.0
+            # IMPORTANT: camera_component.py shares this drone's sysid,
+            # so its heartbeat also arrives here. Only the autopilot's
+            # own heartbeat (compid == self._compid) should update
+            # armed/mode state -- otherwise the camera's heartbeat
+            # (which always reports base_mode=0) would incorrectly
+            # make the drone look disarmed.
+            if msg.get_srcComponent() == self._compid:
+                self._armed       = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                self._custom_mode = msg.custom_mode
+                self._last_hb_at  = time.time()
+                self._heartbeat_age = 0.0
+
+        elif t == "COMMAND_ACK":
+            # The camera component's response to request_external_capture().
+            # See class docstring note above on why we track this by
+            # "most recent" rather than matching an id in the message.
+            if msg.get_srcComponent() == MAV_COMP_ID_CAMERA and msg.command == CAPTURE_COMMAND:
+                self._camera_ack_result = msg.result
 
         elif t == "VFR_HUD":
             self._airspeed    = msg.airspeed
@@ -212,6 +246,10 @@ class Drone:
 
     def get_altitude(self) -> float:
         return self._alt_rel
+
+    def get_heading(self) -> float | None:
+        """Compass heading in degrees (0-360), or None if not yet known."""
+        return self._heading_deg
 
     def get_position(self) -> Waypoint:
         return Waypoint(self._lat, self._lon, self._alt_rel)
@@ -376,3 +414,93 @@ class Drone:
         except Exception:
             return "ERR_HOMEPOINT"
         return "SUCCESS"
+
+    def capture_image(self, timeout: float = 0.5) -> str:
+        """
+        Send MAV_CMD_IMAGE_START_CAPTURE and wait for COMMAND_ACK.
+        Returns SUCCESS or ERR_CAPTURE.
+
+        Timeout is kept short (0.5s) because in SITL ArduPilot has no
+        camera configured and will never ACK this command -- waiting
+        longer would stall the main loop and block every other drone
+        from being polled during that time. On real hardware with a
+        camera component, the ACK would normally arrive almost
+        immediately anyway, well within this window.
+        """
+        self._dispatcher.send_command_long(
+            self._sysid,
+            mavutil.mavlink.MAV_CMD_IMAGE_START_CAPTURE,
+            p1=0,   # camera instance (0 = all cameras)
+            p2=0,   # interval (0 = single capture)
+            p3=1,   # total images to capture
+        )
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self._dispatcher._conn.recv_match(blocking=True, timeout=0.2)
+            if msg is not None:
+                sysid = msg.get_srcSystem()
+                if sysid in self._dispatcher._drones:
+                    self._dispatcher._drones[sysid]._process_message(msg)
+                if msg.get_type() == "COMMAND_ACK":
+                    if msg.command == mavutil.mavlink.MAV_CMD_IMAGE_START_CAPTURE:
+                        if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                            return "SUCCESS"
+                        else:
+                            return "ERR_CAPTURE"
+
+        # No ACK received in time -- expected in SITL, continue anyway
+        print("[CAPTURE] No ACK from sysid={0} within {1}s -- continuing".format(
+            self._sysid, timeout))
+        return "SUCCESS"
+
+    def point_gimbal(self, pitch_deg: float, roll_deg: float = 0.0, yaw_deg: float = 0.0) -> str:
+        """
+        Command the gimbal via ArduPilot's mount control.
+        pitch_deg: -90 = straight down, 0 = forward/horizontal
+        Fire-and-forget -- no ACK wait, since the gimbal's actual
+        joint position is observed by polling, not by a MAVLink ACK.
+        """
+        self._dispatcher.send_command_long(
+            self._sysid,
+            mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL,
+            p1=pitch_deg,
+            p2=roll_deg,
+            p3=yaw_deg,
+            p7=mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING,
+        )
+        return "SUCCESS"
+
+    def request_external_capture(self, request_id: int) -> str:
+        """
+        Sends MAV_CMD_USER_1 to the camera component (same sysid,
+        compid=MAV_COMP_ID_CAMERA), asking it to capture a frame and
+        upload it via MAVFTP. Fire-and-forget -- the result arrives
+        later as a COMMAND_ACK, check it with get_camera_ack().
+
+        request_id becomes part of the remote filename the camera
+        component uses (capture_<request_id>.jpg), so the caller
+        already knows what file to expect.
+        """
+        self._pending_capture_request_id = request_id
+        self._camera_ack_result          = None   # reset, awaiting a fresh ack
+        self._dispatcher.send_command_long(
+            self._sysid,
+            CAPTURE_COMMAND,
+            p1=float(request_id),
+            target_compid=MAV_COMP_ID_CAMERA,
+        )
+        return "SUCCESS"
+
+    def get_camera_ack(self, request_id: int) -> int | None:
+        """
+        Returns the MAV_RESULT value from the camera component's ACK,
+        or None if no ack has arrived yet for this request.
+
+        Returns None (instead of the cached result) if request_id
+        doesn't match the most recently sent request -- this is a
+        sanity check against calling this for a stale/wrong request.
+        """
+        if self._pending_capture_request_id != request_id:
+            return None
+        return self._camera_ack_result

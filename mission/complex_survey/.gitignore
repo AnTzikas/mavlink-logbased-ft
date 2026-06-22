@@ -1,0 +1,6 @@
+__pycache__/
+captures/
+camera_component/camera_component_captures/
+yolov8s.pt         
+tests/test_downloads/
+*.jpg               
