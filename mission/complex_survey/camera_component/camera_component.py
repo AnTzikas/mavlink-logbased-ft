@@ -38,19 +38,22 @@ IMPORTANT -- connection type matters:
 Usage:
     python3 camera_component.py --connection tcp:127.0.0.1:5762 --sysid 1
 """
+
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
- 
+
 # This file lives in camera/, but mavftp.py lives in the project root --
 # add the parent directory to sys.path so the import below still resolves.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
- 
+
 from pymavlink import mavutil
- 
+
 from camera import Camera
 from mavftp import FtpClient, FtpError
+
 
 MAV_COMP_ID_CAMERA = mavutil.mavlink.MAV_COMP_ID_CAMERA   # 100, standard reserved id
 CAPTURE_COMMAND    = mavutil.mavlink.MAV_CMD_USER_1        # custom, ArduPilot ignores this
@@ -65,6 +68,9 @@ def main() -> int:
     parser.add_argument("--autopilot-compid", type=int, default=1, help="Component id of the autopilot (usually 1).")
     parser.add_argument("--world-name", default="large_mission")
     parser.add_argument("--drone-name", default="drone1")
+    parser.add_argument("--udp-port", type=int, default=5600,
+                         help="Gazebo camera stream UDP port for this drone "
+                              "(must differ per drone -- e.g. 5600 for drone1, 5601 for drone2).")
     parser.add_argument("--capture-dir", default="camera_component_captures",
                          help="Local scratch directory for grabbed frames before upload.")
     parser.add_argument("--remote-dir", default="logs",
@@ -79,10 +85,16 @@ def main() -> int:
         source_component=MAV_COMP_ID_CAMERA,
     )
 
+    # Each drone gets its own subfolder, e.g. camera_component_captures/drone1/,
+    # camera_component_captures/drone2/ -- derived from --drone-name, which
+    # is already unique per instance, so no separate flag is needed.
+    drone_capture_dir = os.path.join(args.capture_dir, args.drone_name)
+
     camera = Camera(
-        output_dir=args.capture_dir,
+        output_dir=drone_capture_dir,
         world_name=args.world_name,
         drone_name=args.drone_name,
+        udp_port=args.udp_port,
     )
     ftp = FtpClient(conn, target_system=args.sysid, target_component=args.autopilot_compid)
 

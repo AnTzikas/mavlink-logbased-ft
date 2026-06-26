@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import shlex
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Sequence, Tuple
@@ -50,8 +51,10 @@ class DroneCommand:
     timeout_s: float = 60.0
     tolerance_m: float = 2.0
     issued: bool = False
-    issued_at: Optional[float] = None
-    last_progress_at: Optional[float] = None
+    issued_at: Optional[float] = None           # wall-clock stamp (sentinel/guard only)
+    last_progress_at: Optional[float] = None    # wall-clock stamp (vestigial; vt version is authoritative)
+    issued_at_vt: Optional[int] = None          # vehicle-time (time_boot_ms) stamp at issue
+    last_progress_vt: Optional[int] = None      # vehicle-time stamp at last progress
     best_metric: Optional[float] = None
 
 
@@ -205,6 +208,41 @@ def parse_mission_file(mission_path: str) -> Tuple[List[MissionWaypoint], Option
     return parsed_waypoints, takeoff_alt_m, sorted(ignored_commands)
 
 
+def _resolve_cli_tokens(argv: Optional[Sequence[str]]) -> Optional[Sequence[str]]:
+    """
+    Decide where the mission parameters come from, in priority order:
+      1. argv passed to main() directly (tests / programmatic callers)
+      2. real command-line args  (python3 mission.py --connection ...)
+      3. a config file of CLI-style tokens, path from $MISSION_CONFIG
+         (default: mission.conf in the working dir)
+
+    The file uses the SAME flags as the CLI -- one or many per line,
+    with '#' comments allowed:
+
+        --connection udp:127.0.0.1:14550
+        --mission    /app/missions/large.waypoints
+        --airspeed-m-s 5        # cruise speed
+    """
+    if argv is not None:
+        return argv                      # explicit caller wins
+    if len(sys.argv) > 1:
+        return None                      # real CLI args -> let argparse read sys.argv
+
+    config_path = os.environ.get("MISSION_CONFIG", "mission.conf")
+    if not os.path.exists(config_path):
+        sys.exit("[CONFIG] No CLI args and config file not found: {0}".format(config_path))
+
+    tokens: List[str] = []
+    with open(config_path, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.split("#", 1)[0].strip()   # strip comments + whitespace
+            if line:
+                tokens.extend(shlex.split(line))   # handles quotes, multiple per line
+
+    print("[CONFIG] Loaded {0} tokens from {1}".format(len(tokens), config_path))
+    return tokens
+
+
 class MissionController:
 
     def __init__(
@@ -229,12 +267,17 @@ class MissionController:
         confirm_offset_m: float = 5.0,
         anomaly_threshold: float = 0.15,
         confirm_threshold: float = 0.6,
+        camera_ack_timeout_s: float = 20.0,
+        model_path: Optional[str] = None,
     ) -> None:
         self.connection_string     = connection_string
         self.dispatcher: Optional[MAVLinkDispatcher] = None
         self.pending_waypoints: Deque[MissionWaypoint] = deque(route_waypoints)
         self.takeoff_alt_m         = takeoff_alt_m
         self.airspeed_m_s          = airspeed_m_s
+        # poll_interval_s is currently only referenced by the (commented-out)
+        # sleep in run(); pacing is handled by the blocking recv inside
+        # dispatcher.update(). Kept so the sleep can be re-enabled if needed.
         self.poll_interval_s       = poll_interval_s
         self.waypoint_tolerance_m  = waypoint_tolerance_m
         self.takeoff_tolerance_m   = takeoff_tolerance_m
@@ -250,14 +293,20 @@ class MissionController:
         self.confirm_offset_m      = confirm_offset_m
         self.anomaly_threshold     = anomaly_threshold
         self.confirm_threshold     = confirm_threshold
+        # Must exceed camera_component.py's worst-case retry budget (several
+        # attempts with exponential backoff + ffmpeg time per attempt),
+        # otherwise mission.py gives up on the ack before the camera even
+        # finishes its own legitimate retries. Default 20s is comfortable.
+        self.camera_ack_timeout_s  = camera_ack_timeout_s
         self.drones: List[DroneRuntime] = []
         self.total_waypoints       = len(route_waypoints)
         self.finished_waypoints    = 0
         self.last_status_at        = 0.0
         self.capture_dir           = capture_dir   # local dir for FTP-downloaded captures
         self._request_id_counter   = 0
+
         print("[DETECTOR] Loading YOLO model (this may take a moment)...")
-        self.detector = Detector()
+        self.detector = Detector(model_path=model_path) if model_path else Detector()
 
     def _next_request_id(self) -> int:
         self._request_id_counter += 1
@@ -341,7 +390,10 @@ class MissionController:
             if self._mission_is_stuck():
                 raise RuntimeError("All drones failed. Mission cannot continue.")
 
-            time.sleep(self.poll_interval_s)
+            # Pacing is handled by the blocking recv (with timeout) inside
+            # dispatcher.update(), so this explicit sleep is intentionally
+            # left disabled. Re-enable if update() is ever made non-blocking.
+            # time.sleep(self.poll_interval_s)
 
     def close(self) -> None:
         if self.dispatcher is not None:
@@ -370,13 +422,25 @@ class MissionController:
             print("[ASSIGN] {0} <- WP#{1} ({2:.5f}, {3:.5f})".format(
                 runtime.name, waypoint.source_index, waypoint.lat, waypoint.lon))
 
+    def _build_inspection_commands(self, waypoint: MissionWaypoint) -> List[DroneCommand]:
+        """The inspection phase of a waypoint visit: a single INSPECT_NADIR.
+        If the nadir capture finds an anomaly, the Stage-2 four-side
+        commands are inserted dynamically afterwards (see
+        _handle_inspect_nadir_complete)."""
+        return [DroneCommand(
+            kind="inspect_nadir",
+            label="INSPECT NADIR WP#{0}".format(waypoint.source_index),
+            waypoint=waypoint,
+            timeout_s=self.capture_settle_s + 10.0,
+        )]
+
     def _build_command_queue(self, runtime: DroneRuntime, waypoint: MissionWaypoint) -> List[DroneCommand]:
         """
-        Builds ARM -> TAKEOFF -> GOTO -> INSPECT_NADIR -> RETURN HOME.
-        LAND / DISARM are NOT added here -- inserted dynamically by
-        _decide_after_return_home(). Stage-2 inspect_side commands are
-        ALSO inserted dynamically, right after INSPECT_NADIR, only if
-        an anomaly is found there.
+        Builds ARM -> TAKEOFF -> GOTO -> [inspection commands] ->
+        RETURN HOME. LAND / DISARM are NOT added here -- inserted
+        dynamically by _decide_after_return_home(). Stage-2 inspect_side
+        commands are ALSO inserted dynamically, right after INSPECT_NADIR,
+        only if an anomaly is found there.
         """
         return [
             DroneCommand(kind="arm",    label="ARM",    timeout_s=30.0, tolerance_m=0.0),
@@ -394,12 +458,7 @@ class MissionController:
                 timeout_s=self.no_progress_timeout_s,
                 tolerance_m=self.waypoint_tolerance_m,
             ),
-            DroneCommand(
-                kind="inspect_nadir",
-                label="INSPECT NADIR WP#{0}".format(waypoint.source_index),
-                waypoint=waypoint,
-                timeout_s=self.capture_settle_s + 10.0,
-            ),
+            *self._build_inspection_commands(waypoint),
             DroneCommand(
                 kind="goto_home",
                 label="RETURN HOME",
@@ -421,12 +480,7 @@ class MissionController:
                 timeout_s=self.no_progress_timeout_s,
                 tolerance_m=self.waypoint_tolerance_m,
             ),
-            DroneCommand(
-                kind="inspect_nadir",
-                label="INSPECT NADIR WP#{0}".format(waypoint.source_index),
-                waypoint=waypoint,
-                timeout_s=self.capture_settle_s + 10.0,
-            ),
+            *self._build_inspection_commands(waypoint),
             DroneCommand(
                 kind="goto_home",
                 label="RETURN HOME",
@@ -681,6 +735,8 @@ class MissionController:
         command.issued           = True
         command.issued_at        = time.time()
         command.last_progress_at = command.issued_at
+        command.issued_at_vt     = runtime.drone.get_boot_ms()
+        command.last_progress_vt = command.issued_at_vt
         command.best_metric      = self._remaining_metric(runtime, command)
         runtime.phase            = command.label
         # Skip the per-command print for Stage 2 sub-steps -- the
@@ -702,7 +758,12 @@ class MissionController:
             if command.kind == "disarm":
                 return not runtime.drone.is_armed()
             if command.kind == "charge_wait":
-                return (time.time() - command.issued_at) >= self.charge_delay_s
+                # Vehicle-time so a restore mid-charge resumes correctly
+                # rather than counting the dead/checkpointed gap.
+                now_vt = runtime.drone.get_boot_ms()
+                if now_vt is None or command.issued_at_vt is None:
+                    return False
+                return (now_vt - command.issued_at_vt) >= self.charge_delay_s * 1000.0
             if command.kind in ("inspect_nadir", "capture_side"):
                 return self._poll_capture_command(runtime, command)
         except Exception as exc:
@@ -724,21 +785,27 @@ class MissionController:
                         ack-timeout applies here, since waiting for an
                         ack is a different kind of wait than settling.
 
+        All timing is measured on the autopilot clock (time_boot_ms) so a
+        checkpoint/restore landing inside any phase resumes correctly
+        instead of counting the time the process spent dead.
+
         Returns True once the command is fully done (image downloaded,
         OR conclusively failed/timed out -- either way we move on
         rather than stalling the whole mission on one bad capture).
         """
-        elapsed_since_issued = time.time() - command.issued_at
+        now_vt = runtime.drone.get_boot_ms()
+        if now_vt is None or command.issued_at_vt is None:
+            return False   # no vehicle-time clock yet -- wait for telemetry
 
         # Phase 1: settling
-        if elapsed_since_issued < self.capture_settle_s:
+        if (now_vt - command.issued_at_vt) < self.capture_settle_s * 1000.0:
             return False
 
         # Phase 2: send the trigger exactly once, right as settling ends
         if command.request_id is None:
             command.request_id = self._next_request_id()
             runtime.drone.request_external_capture(command.request_id)
-            command._trigger_sent_at = time.time()
+            command._trigger_sent_vt = now_vt
             return False
 
         # Phase 3: already resolved in an earlier tick?
@@ -748,8 +815,9 @@ class MissionController:
         ack_result = runtime.drone.get_camera_ack(command.request_id)
 
         if ack_result is None:
-            if time.time() - command._trigger_sent_at > 5.0:
-                print("[CAPTURE] {0}: no camera ack within 5s -- giving up.".format(command.label))
+            if (now_vt - command._trigger_sent_vt) > self.camera_ack_timeout_s * 1000.0:
+                print("[CAPTURE] {0}: no camera ack within {1:.0f}s -- giving up.".format(
+                    command.label, self.camera_ack_timeout_s))
                 command._captured_image = None
                 return True
             return False   # still waiting, within the ack timeout
@@ -786,8 +854,11 @@ class MissionController:
             if command.kind == "land":
                 return runtime.drone.get_altitude()
             if command.kind == "charge_wait":
-                if command.issued_at is not None:
-                    return max(0.0, self.charge_delay_s - (time.time() - command.issued_at))
+                # Remaining charge seconds on the vehicle clock (display/
+                # best_metric only -- charge_wait is skipped in _check_progress).
+                now_vt = runtime.drone.get_boot_ms()
+                if command.issued_at_vt is not None and now_vt is not None:
+                    return max(0.0, self.charge_delay_s - (now_vt - command.issued_at_vt) / 1000.0)
             # Note: inspect_nadir / capture_side have no entry here --
             # _check_progress() skips them entirely (see below), since
             # their timing (settle + trigger + ack-wait) is fully
@@ -801,23 +872,46 @@ class MissionController:
             return
         if command.kind in ("charge_wait", "inspect_nadir", "capture_side"):
             return
-        now = time.time()
-        if now - command.issued_at > command.timeout_s and command.kind in ("arm", "disarm"):
+
+        # Measure elapsed time on the autopilot's own clock (time_boot_ms),
+        # which travels inside the replayed telemetry and is rebuilt on
+        # restore. Wall clock (time.time()) would also count the time the
+        # process spent checkpointed/dead, which falsely trips the
+        # no-progress timeout right after a slow restore.
+        now_vt = runtime.drone.get_boot_ms()
+        if now_vt is None:
+            return   # no telemetry yet -- can't measure, so don't enforce
+
+        # If the command was issued before any position fix was available,
+        # adopt the first sample we see as the baseline (count from here).
+        if command.issued_at_vt is None:
+            command.issued_at_vt     = now_vt
+            command.last_progress_vt = now_vt
+            return
+
+        timeout_ms = command.timeout_s * 1000.0
+
+        if (now_vt - command.issued_at_vt) > timeout_ms and command.kind in ("arm", "disarm"):
             self._mark_failed(runtime, "Timeout waiting for {0}".format(command.label))
             return
+
         metric = self._remaining_metric(runtime, command)
         if metric is not None:
             if command.best_metric is None or metric < (command.best_metric - 0.5):
                 command.best_metric      = metric
-                command.last_progress_at = now
-            last = command.last_progress_at or command.issued_at
-            if now - last > command.timeout_s:
+                command.last_progress_vt = now_vt
+            last_vt = command.last_progress_vt if command.last_progress_vt is not None else command.issued_at_vt
+            if (now_vt - last_vt) > timeout_ms:
                 self._mark_failed(runtime, "No progress on {0}".format(command.label))
 
     def _check_health(self, runtime: DroneRuntime) -> None:
         try:
-            age = runtime.drone.get_heartbeat_age()
-            if age > self.heartbeat_timeout_s:
+            # Heartbeat age on the vehicle clock -- restore-safe. Returns
+            # None until both a heartbeat stamp and a current position
+            # sample exist, in which case we don't enforce (avoids a
+            # false timeout on the first tick right after a restore).
+            age = runtime.drone.get_heartbeat_age_vt()
+            if age is not None and age > self.heartbeat_timeout_s:
                 self._mark_failed(runtime, "Heartbeat timeout ({0:.1f}s)".format(age))
                 return
             cmd = runtime.active_command()
@@ -864,6 +958,9 @@ class MissionController:
         return all(runtime.failed for runtime in self.drones)
 
     def _report_status_if_needed(self) -> None:
+        # Wall-clock throttle is intentional here: this only gates how often
+        # a human-facing status line prints; it never fails anything. After a
+        # restore the worst case is one immediate status print, then normal.
         now = time.time()
         if now - self.last_status_at < self.status_interval_s:
             return
@@ -891,14 +988,14 @@ class MissionController:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Multi-drone mission controller with two-stage object inspection."
+        description="Drone mission controller with two-stage object inspection."
     )
     parser.add_argument("--connection",            required=True,             help="MAVLink connection string (e.g. udp:127.0.0.1:14553).")
     parser.add_argument("--mission",               required=True,             help="Path to QGC .waypoints file.")
     parser.add_argument("--discovery-timeout-s",   type=float, default=10.0, help="Seconds to listen for drones on startup.")
     parser.add_argument("--takeoff-alt-m",         type=float, default=None, help="Override takeoff altitude.")
     parser.add_argument("--airspeed-m-s",          type=float, default=5.0,  help="Cruise airspeed in m/s.")
-    parser.add_argument("--poll-interval-s",       type=float, default=0.5,  help="Main loop polling interval.")
+    parser.add_argument("--poll-interval-s",       type=float, default=0.5,  help="Main loop polling interval (only used if the run()-loop sleep is re-enabled).")
     parser.add_argument("--waypoint-tolerance-m",  type=float, default=3.0,  help="Waypoint arrival radius.")
     parser.add_argument("--takeoff-tolerance-m",   type=float, default=1.0,  help="Takeoff altitude tolerance.")
     parser.add_argument("--landing-tolerance-m",   type=float, default=0.4,  help="Landing altitude tolerance.")
@@ -913,12 +1010,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-offset-m",      type=float, default=5.0,  help="Horizontal offset from target during Stage 2.")
     parser.add_argument("--anomaly-threshold",     type=float, default=0.15, help="Stage 1: minimum confidence to count as 'something detected'.")
     parser.add_argument("--confirm-threshold",     type=float, default=0.6,  help="Stage 2: minimum confidence to count as confirmed.")
+    parser.add_argument("--camera-ack-timeout-s",  type=float, default=20.0, help="Max seconds to wait for the camera component's ACK before giving up on a capture.")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to the YOLO .pt model. Defaults to the detector's built-in path if omitted.")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_argument_parser()
-    args   = parser.parse_args(argv)
+    args = parser.parse_args(_resolve_cli_tokens(argv))
 
     route_waypoints, mission_takeoff_alt, ignored = parse_mission_file(args.mission)
     takeoff_alt_m = args.takeoff_alt_m if args.takeoff_alt_m is not None else mission_takeoff_alt
@@ -948,6 +1047,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         confirm_offset_m=args.confirm_offset_m,
         anomaly_threshold=args.anomaly_threshold,
         confirm_threshold=args.confirm_threshold,
+        camera_ack_timeout_s=args.camera_ack_timeout_s,
+        model_path=args.model_path,
     )
 
     try:

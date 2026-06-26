@@ -17,6 +17,7 @@ def main():
     run_cmd("rm -rf experiment_logs/logfiles/*")
     run_cmd("rm -rf experiment_logs/mission_logs/*")
     run_cmd("rm -rf experiment_logs/wrapper_logs/*")
+    run_cmd("rm -rf experiment_logs/capture/*")
 
 
 if __name__ == "__main__":

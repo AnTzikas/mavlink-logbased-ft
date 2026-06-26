@@ -12,7 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nftables \
     iptables \
     curl ca-certificates \
+    libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir ultralytics
+RUN pip uninstall -y opencv-python opencv-python-headless \
+ && pip install --no-cache-dir opencv-python-headless
+RUN python3 -c "import cv2; print('cv2 OK', cv2.__version__)"
 
 # Install python packages for wrapper
 RUN pip install --no-cache-dir pymavlink sysv_ipc
@@ -27,7 +34,7 @@ WORKDIR /app/src
 #     chmod 0440 /etc/sudoers.d/nopasswd
 
 # Command to run script
-# CMD ["sleep", "infinity"]
-CMD ["python3", "-u", "supervisor.py"]
+CMD ["sleep", "infinity"]
+# CMD ["python3", "-u", "supervisor.py"]
 
 

@@ -14,6 +14,11 @@ Usage:
 import argparse
 import sys
 import time
+from pathlib import Path
+
+# This file lives in camera/, but mavftp.py lives in the project root --
+# add the parent directory to sys.path so the import below still resolves.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pymavlink import mavutil
 
@@ -47,14 +52,20 @@ def request_capture(dispatcher, sysid, request_id) -> None:
     )
 
 
-def wait_for_camera_ack(dispatcher, timeout_s=5.0) -> bool:
-    """Waits for a COMMAND_ACK whose SOURCE component is the camera
-    (compid=100) -- COMMAND_ACK itself has no addressing fields, so we
-    identify the sender via the message's transport-level source."""
+def wait_for_camera_ack(dispatcher, expected_sysid: int, timeout_s=5.0) -> bool:
+    """Waits for a COMMAND_ACK whose SOURCE is the camera (compid=100)
+    on the SPECIFIC drone we're testing. COMMAND_ACK itself has no
+    addressing fields, so we identify the sender via the message's
+    transport-level source -- both sysid AND compid, since with
+    multiple drones' camera components potentially running, an ack
+    from the WRONG drone's camera could otherwise be mistaken for
+    the one we're waiting for."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         msg = dispatcher._conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=0.5)
         if msg is None:
+            continue
+        if msg.get_srcSystem() != expected_sysid:
             continue
         if msg.get_srcComponent() != MAV_COMP_ID_CAMERA:
             continue
@@ -73,6 +84,10 @@ def main() -> int:
     parser.add_argument("--alt-m", type=float, default=15.0)
     parser.add_argument("--request-id", type=int, default=1)
     parser.add_argument("--download-dir", default="test_downloads")
+    parser.add_argument("--sysid", type=int, default=None,
+                         help="Target this specific drone's sysid. If omitted, uses "
+                              "whichever sysid discovery finds first (not guaranteed "
+                              "with multiple drones present).")
     args = parser.parse_args()
 
     import os
@@ -84,7 +99,18 @@ def main() -> int:
         print("[TEST] No drones discovered.")
         return 1
 
-    sysid = sysids[0]
+    if args.sysid is not None:
+        if args.sysid not in sysids:
+            print("[TEST] Requested sysid={0} not among discovered drones {1}.".format(
+                args.sysid, sysids))
+            return 1
+        sysid = args.sysid
+    else:
+        sysid = sysids[0]
+        if len(sysids) > 1:
+            print("[TEST] Multiple drones discovered {0}, no --sysid given -- "
+                  "defaulting to {1}.".format(sysids, sysid))
+
     drone = Drone(dispatcher, sysid)
     dispatcher.register(drone)
 
@@ -107,7 +133,7 @@ def main() -> int:
     request_capture(dispatcher, sysid, args.request_id)
 
     print("[TEST] Waiting for camera ACK...")
-    confirmed = wait_for_camera_ack(dispatcher, timeout_s=10.0)
+    confirmed = wait_for_camera_ack(dispatcher, sysid, timeout_s=10.0)
     if not confirmed:
         print("[TEST] FAILED -- no ACK (or rejected) from camera component.")
     else:

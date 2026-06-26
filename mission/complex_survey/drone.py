@@ -1,6 +1,21 @@
 from pymavlink import mavutil
 import time
 import math
+from typing import Optional
+import sys, os
+from pathlib import Path
+
+# Include Wrapper or Default Pymavlink
+current_dir = Path(__file__).resolve().parent
+sys.path.append(str(current_dir.parent.parent / "src"))
+
+USE_WRAPPER = os.environ.get("USE_WRAPPER", "0") == "1"
+if USE_WRAPPER:
+    from wrapper import mavlink_connection as mav_connect
+    logger_name = "FT_Mission"
+else:
+    from pymavlink.mavutil import mavlink_connection as mav_connect
+    logger_name = "Std_Mission"
 
 # ArduCopter custom mode IDs
 COPTER_MODE_GUIDED = 4
@@ -39,10 +54,16 @@ class ParameterProxy:
 
 class MAVLinkDispatcher:
     """Owns the single MAVLink connection, discovers drones and routes
-    incoming messages to the correct Drone instance by sysid."""
+    incoming messages to the correct Drone instance by sysid.
+
+    The connection is created via mav_connect (see top of file): when
+    USE_WRAPPER=1 this is the record/replay wrapper, otherwise it is raw
+    pymavlink. Either way the object quacks like a pymavlink connection,
+    so every self._conn.<method> call (recv_match, mav.*_send, ...) is
+    transparently routed through whichever backend is active."""
 
     def __init__(self, connection_string: str, discovery_timeout_s: float = 10.0):
-        self._conn               = mavutil.mavlink_connection(connection_string)
+        self._conn               = mav_connect(connection_string)
         self._drones: dict[int, "Drone"] = {}
         self.discovery_timeout_s = discovery_timeout_s
 
@@ -69,17 +90,26 @@ class MAVLinkDispatcher:
     def register(self, drone: "Drone") -> None:
         self._drones[drone._sysid] = drone
 
-    def update(self, max_messages: int = 100) -> None:
-        """Drain pending MAVLink messages and route each to the correct drone."""
-        for _ in range(max_messages):
-            msg = self._conn.recv_match(blocking=False)
-            if msg is None:
-                break
+    def update(self, max_messages: int = 100, timeout: float = 0.5) -> None:
+        """Drain pending MAVLink messages and route each to the correct drone.
+
+        Blocks up to `timeout` for the FIRST message -- this replaces the
+        mission loop's sleep(poll_interval): it wakes immediately when data
+        arrives, or after `timeout` if the link is quiet, instead of busy-
+        spinning. Once the first message is in, the rest of the socket buffer
+        is drained non-blocking."""
+        msg = self._conn.recv_match(blocking=True, timeout=timeout)
+        drained = 0
+        while msg is not None and drained < max_messages:
             sysid = msg.get_srcSystem()
             if sysid in self._drones:
                 self._drones[sysid]._process_message(msg)
+            drained += 1
+            msg = self._conn.recv_match(blocking=False)   # drain the rest instantly
 
-        # Age the heartbeat timer for every registered drone
+        # Age the wall-clock heartbeat timer for every registered drone.
+        # (This is the wall-clock liveness signal, separate from the vehicle-
+        # time heartbeat age used for restore-safe failure detection.)
         for drone in self._drones.values():
             if drone._last_hb_at is not None:
                 drone._heartbeat_age = time.time() - drone._last_hb_at
@@ -141,11 +171,13 @@ class Drone:
         self._custom_mode  = -1
         self._airspeed     = 0.0
         self._groundspeed  = 0.0
-        self._last_hb_at: float | None = None
-        self._heartbeat_age = 0.0
+        self._last_hb_at: float | None = None     # wall-clock stamp at last heartbeat
+        self._heartbeat_age = 0.0                 # wall-clock heartbeat age (liveness only)
         self._home: Waypoint | None = None
-        self._battery_remaining: int = 100   # percent, updated by BATTERY_STATUS
-        self._heading_deg: float | None = None   # compass heading, from GLOBAL_POSITION_INT.hdg
+        self._battery_remaining: int = 100        # percent, updated by BATTERY_STATUS
+        self._heading_deg: float | None = None    # compass heading, from GLOBAL_POSITION_INT.hdg
+        self._boot_ms: int | None = None          # autopilot uptime (GLOBAL_POSITION_INT.time_boot_ms) -- restore-safe clock
+        self._last_hb_vt: int | None = None       # vehicle clock (time_boot_ms) at last heartbeat
 
         # Camera ACK tracking. COMMAND_ACK carries no request_id of its
         # own (it only has 'command' and 'result'), so we can't match
@@ -179,6 +211,7 @@ class Drone:
             self._lat     = msg.lat / 1e7
             self._lon     = msg.lon / 1e7
             self._alt_rel = msg.relative_alt / 1000.0
+            self._boot_ms = msg.time_boot_ms
             # hdg is compass heading in centidegrees, 0-35999, or
             # 65535 if unknown/unavailable
             if msg.hdg != 65535:
@@ -195,6 +228,7 @@ class Drone:
                 self._armed       = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                 self._custom_mode = msg.custom_mode
                 self._last_hb_at  = time.time()
+                self._last_hb_vt  = self._boot_ms       # snapshot the vehicle clock at this heartbeat
                 self._heartbeat_age = 0.0
 
         elif t == "COMMAND_ACK":
@@ -251,6 +285,23 @@ class Drone:
         """Compass heading in degrees (0-360), or None if not yet known."""
         return self._heading_deg
 
+    def get_boot_ms(self) -> int | None:
+        """Autopilot uptime in ms (GLOBAL_POSITION_INT.time_boot_ms), or None
+        if no position message has arrived yet. This clock lives inside the
+        replayed telemetry, so it is reconstructed on restore -- unlike
+        time.time(), it does not advance while the process is checkpointed/dead."""
+        return self._boot_ms
+
+    def get_heartbeat_age_vt(self) -> Optional[float]:
+        """Heartbeat age on the autopilot clock (restore-safe). None until we
+        have both a heartbeat stamp and a current vehicle-time sample.
+
+        Used for failure detection: it does NOT count time the process spent
+        checkpointed/dead, so it won't false-fail right after a slow restore."""
+        if self._last_hb_vt is None or self._boot_ms is None:
+            return None
+        return (self._boot_ms - self._last_hb_vt) / 1000.0
+
     def get_position(self) -> Waypoint:
         return Waypoint(self._lat, self._lon, self._alt_rel)
 
@@ -263,6 +314,11 @@ class Drone:
         return self._armed
 
     def get_heartbeat_age(self) -> float:
+        """Wall-clock heartbeat age in seconds. This is the LIVENESS signal:
+        unlike the vehicle-time version, it keeps advancing even when telemetry
+        stops, so it can detect a genuinely dead link. NOT used for the current
+        restore-safe failure path (that uses get_heartbeat_age_vt); kept as a
+        complementary signal for status/debugging."""
         return self._heartbeat_age
 
     def get_battery_remaining(self) -> int:
@@ -383,6 +439,9 @@ class Drone:
         return "SUCCESS"
 
     def goto_home(self, airspeed: float = 1.0) -> str:
+        # NOTE: not used by the current mission -- the mission returns home by
+        # calling goto_waypoint() with the home coordinates (its "goto_home"
+        # command kind), not this method. Kept as library surface.
         if self.status in ("RTL", "FS_RTL"):
             return "ERR_ABORTING"
         if self._home is None:
@@ -417,6 +476,11 @@ class Drone:
 
     def capture_image(self, timeout: float = 0.5) -> str:
         """
+        NOTE: not used by the current mission -- captures go through the
+        external camera component via request_external_capture(). Kept as
+        library surface for the autopilot-native MAV_CMD_IMAGE_START_CAPTURE
+        path.
+
         Send MAV_CMD_IMAGE_START_CAPTURE and wait for COMMAND_ACK.
         Returns SUCCESS or ERR_CAPTURE.
 

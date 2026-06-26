@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -80,7 +81,7 @@ class Camera:
     # Capture
     # -----------------------------------------------------------------------
 
-    def capture(self, label, subdir: Optional[str] = None) -> Optional[str]:
+    def capture(self, label, subdir: Optional[str] = None, max_retries: int = 6) -> Optional[str]:
         """
         Grab one frame from the Gazebo UDP stream using ffmpeg.
 
@@ -91,8 +92,21 @@ class Camera:
         (e.g. captures/wp02/nadir_HHMMSS.jpg) -- used to keep all photos
         for one waypoint together.
 
-        Returns the saved file path, or None on failure. Logging is left
-        to the caller to avoid duplicate prints.
+        Each capture spawns a fresh ffmpeg process that binds to this
+        drone's dedicated UDP port. Under heavy load (multiple drones +
+        Gazebo + SITL + YOLO all competing for CPU), the OS occasionally
+        hasn't fully released the previous ffmpeg process's socket
+        before the next one tries to bind, causing an intermittent
+        "Address already in use" error. This is automatically retried
+        with EXPONENTIAL BACKOFF (0.3s, 0.6s, 1.2s, 2.4s, ...) since a
+        fixed short delay (previously 3 attempts at 0.3s) wasn't always
+        enough under real multi-drone load -- it's a transient timing
+        race, not a real failure; everything else about the capture is
+        otherwise fine.
+
+        Returns the saved file path, or None on failure (after retries
+        are exhausted). Logging is left to the caller to avoid duplicate
+        prints, except for the retry attempts themselves.
         """
         label_str = "wp{:02d}".format(label) if isinstance(label, int) else str(label)
 
@@ -101,6 +115,23 @@ class Camera:
             out_dir = os.path.join(self._output_dir, subdir)
             os.makedirs(out_dir, exist_ok=True)
 
+        delay = 0.6 #old was 0.3
+        for attempt in range(1, max_retries + 1):
+            result_path = self._try_capture_once(label_str, out_dir)
+            if result_path is not None:
+                return result_path
+
+            if attempt < max_retries:
+                print("[CAMERA] Capture attempt {0}/{1} failed, retrying in {2:.1f}s...".format(
+                    attempt, max_retries, delay))
+                time.sleep(delay)
+                delay *= 2.0
+
+        return None
+
+    def _try_capture_once(self, label_str: str, out_dir: str) -> Optional[str]:
+        """Single capture attempt. Returns the saved path, or None on
+        failure (caller decides whether to retry)."""
         # Write SDP to a temp file so ffmpeg can open the stream
         sdp_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".sdp", delete=False)
@@ -139,12 +170,21 @@ class Camera:
                 print("[CAMERA] ffmpeg produced no output")
                 return None
 
-            # Move to permanent location with meaningful name
+            # Re-ensure the destination directory exists right before
+            # writing -- defensive, in case anything unexpected removed
+            # it between Camera.__init__() and this point.
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Move to permanent location with meaningful name. Using
+            # shutil.move() instead of os.rename() -- rename() requires
+            # both paths on the same filesystem, and /tmp is sometimes
+            # a separate tmpfs mount from the project directory, which
+            # would make plain rename() fail unpredictably.
             save_path = os.path.join(
                 out_dir,
                 "{0}_{1}.jpg".format(label_str, time.strftime("%H%M%S")),
             )
-            os.rename(out_path, save_path)
+            shutil.move(out_path, save_path)
             return save_path
 
         except subprocess.TimeoutExpired:

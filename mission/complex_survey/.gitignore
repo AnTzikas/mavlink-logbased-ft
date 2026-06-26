@@ -4,3 +4,7 @@ camera_component/camera_component_captures/
 yolov8s.pt         
 tests/test_downloads/
 *.jpg               
+drone_old.py 
+nocam_mission.py 
+old_mission.py 
+compare_ports.py

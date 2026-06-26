@@ -13,8 +13,10 @@ from typing import Optional
 # COCO car class id for Ultralytics YOLOv8 COCO models
 CAR_CLASS_ID = 2
 
-DEFAULT_MODEL_PATH = "yolov8s.pt"
-DEFAULT_CONF_THR    = 0.6
+# Fallback model path used when the caller does not pass one explicitly
+# (e.g. when --model-path / mission.conf omits it).
+DEFAULT_MODEL_PATH = "/app/missions/complex_survey/yolov8s.pt"
+DEFAULT_CONF_THR   = 0.6
 
 
 class Detector:
@@ -35,6 +37,14 @@ class Detector:
     ):
         from ultralytics import YOLO
 
+        # Fail loud on a bad path instead of letting ultralytics treat an
+        # unrecognized path as a model name and try to DOWNLOAD it -- which,
+        # with no network egress, hangs or errors obscurely.
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                "[DETECTOR] Model not found at {0} -- check --model-path / mission.conf".format(model_path)
+            )
+
         print("[DETECTOR] Loading YOLOv8 model from {0}...".format(model_path))
         self._model          = YOLO(model_path)
         self._conf_threshold = conf_threshold
@@ -50,7 +60,6 @@ class Detector:
         target class (e.g. car), or None if no such detection was found.
         """
         import cv2
-        from collections import Counter
 
         frame = cv2.imread(image_path)
         if frame is None:
