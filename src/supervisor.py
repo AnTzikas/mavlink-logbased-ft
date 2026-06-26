@@ -130,13 +130,27 @@ class Supervisor:
                 # print(f"[Supervisor] Rotation failed for {path}: {e}")
                 supervisor_print(f"Rotation failed for {path}: {e}")
     
+    def _reset_lock(self):
+        """Force the checkpoint lock to 'available' (1) before (re)starting
+        the mission. SysV semaphores are kernel-persistent and are NOT
+        auto-released when a holder dies (no SEM_UNDO in use), so a dump/kill
+        that left the value at 0 would otherwise make the restored mission
+        block forever on its first acquire(). Only safe to call here, at the
+        top of the restart cycle, when no live mission process holds the lock."""
+        try:
+            supervisor_print(f"Lock value before reset: {self.sem.value}")
+            self.sem.value = 1
+        except sysv_ipc.ExistentialError:
+            self.sem = sysv_ipc.Semaphore(0x1234, sysv_ipc.IPC_CREAT, initial_value=1)
+
     def run(self):
         """Main lifecycle controller."""
 
         flag_path = os.path.join(f"{CHECKPOINT_BASEDIR}/mission_logs", "mission_completed.flag")
 
         while True:
-            print("Try to init")
+            supervisor_print("Reset lock and run")
+            self._reset_lock()
             if not self._initialize_mission():
                 # print("[Supervisor] Fatal: Mission failed to start/restore.")
                 supervisor_print("Fatal: Mission failed to start/restore.")
@@ -157,7 +171,7 @@ class Supervisor:
                                 supervisor_print("Mission completed. Exiting.")
                                 return
                             else:
-                                print("Restart!")
+                                supervisor_print("Restart!")
                                 restart_needed = True
                                 break
                                 # os._exit(137)

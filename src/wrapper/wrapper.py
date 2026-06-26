@@ -16,6 +16,9 @@ from wrapper.ipc_sem import IPCClient
 WRAPPER  = "\033[91m" 
 RESET   = "\033[0m"
 
+# module level
+_BUFFER_EXHAUSTED = object()   # unique sentinel, distinct from None and from any msg
+
 def wrapper_print(msg):
     print(f"{WRAPPER}[Wrapper] {msg}{RESET}")
 
@@ -99,6 +102,29 @@ class _MavSenderProxy:
             target_system, target_component, param_id, param_value, param_type
         )
     
+    #! Not tested yet
+    def set_position_target_global_int_send(self, time_boot_ms, target_system, target_component, coordinate_frame, type_mask, lat_int, lon_int, alt, vx, vy, vz, afx, afy, afz, yaw, yaw_rate):
+        # Create a summary capturing the most vital navigation data
+        args_summary = f"SET_POS_GLOBAL_INT(sys={target_system}, frame={coordinate_frame}, lat={lat_int}, lon={lon_int}, alt={alt})"
+        
+        self._execute_send_flow(
+            constants.SET_POSITION_TARGET_GLOBAL_INT_SEND_ID, 
+            args_summary, 
+            "set_position_target_global_int_send",
+            time_boot_ms, target_system, target_component, coordinate_frame, type_mask, lat_int, lon_int, alt, vx, vy, vz, afx, afy, afz, yaw, yaw_rate
+        )
+    
+    #! NOt tested yet
+    def file_transfer_protocol_send(self, target_network, target_system, target_component, payload):
+        # Summarize the FTP payload size rather than dumping the raw bytes into the string
+        args_summary = f"FTP_SEND(net={target_network}, sys={target_system}, comp={target_component}, payload_len={len(payload)})"
+        
+        self._execute_send_flow(
+            constants.FILE_TRANSFER_PROTOCOL_SEND_ID, 
+            args_summary, 
+            "file_transfer_protocol_send",
+            target_network, target_system, target_component, payload
+        )
     def __getattr__(self, name):
         # Pass through all other attributes to the real mav object
         return getattr(self._real_mav, name)
@@ -224,7 +250,7 @@ class MavlinkWrapper:
         return self._is_replay_mode
     
     # Generalized execution flow for input operations
-    def _execute_receive_flow(self, api_id: int, method_name: str, *args, **kwargs):
+    def _old_execute_receive_flow(self, api_id: int, method_name: str, *args, **kwargs):
         
         # Acquire checkpoint lock
         self._checkpoint_lock.acquire()
@@ -270,6 +296,68 @@ class MavlinkWrapper:
         
         return msg
 
+    def _execute_receive_flow(self, api_id: int, method_name: str, *args, **kwargs):
+        
+        # Acquire checkpoint lock
+        self._checkpoint_lock.acquire()
+
+        # Replay mode
+        if self.is_replay_mode:
+
+            # Consume next entry from replay buffer
+            msg = self._handle_replay_receive()
+
+            # Anything that is NOT the exhaustion sentinel is a faithful
+            # replay value -- INCLUDING a recorded None (a timeout that must
+            # be replayed as None, not escalated to a live read).
+            if msg is not _BUFFER_EXHAUSTED:
+
+                # PANIC: with None now replayed faithfully, the only way a
+                # typed recv_match can get the wrong message back is a real
+                # replay desync. Fail loud and located instead of letting a
+                # wrong-type message crash obscurely downstream (e.g. FTP).
+                req_type = kwargs.get("type")
+                if req_type is not None and msg is not None and msg.get_type() != req_type:
+                    raise RuntimeError(
+                        f"REPLAY DESYNC: recv_match(type={req_type}) but buffer "
+                        f"returned {msg.get_type()} at recv index "
+                        f"{self._recv_buffer._index}"
+                    )
+
+                self._wrapper_log(
+                    direction="RECV",
+                    api=method_name,
+                    outcome="REPLAY",
+                    summary=(f"type={msg.get_type()} src={msg.get_srcSystem()}"
+                             if msg is not None else "type=None (recorded timeout)"),
+                )
+                return msg
+
+        # Check if need to go to replay mode
+        if self._poll_restore_status():
+            # Call again the same primitive
+            return self._execute_receive_flow(api_id, method_name, *args, **kwargs)
+
+        # Live Mode execution
+        # Call the underlying pymavlink method
+        real_method = getattr(self._conn, method_name)
+        msg = real_method(*args, **kwargs)
+        
+        #Log the interaction
+        self._log_receive_interaction(msg, api_id)
+        if msg is not None:
+            self._wrapper_log(
+                direction="RECV",
+                api=method_name,
+                outcome="LIVE",
+                summary=f"type={msg.get_type()} src={msg.get_srcSystem()}"
+            )
+
+        #Release checkpoint lock
+        self._checkpoint_lock.release()
+        
+        return msg
+    
     # Check if replay is needed
     def _poll_restore_status(self) -> bool:
         recv_needs_restore = self._recv_journal.check_restore_needed()
@@ -330,7 +418,7 @@ class MavlinkWrapper:
             self.exit_replay_mode() 
             # wrapper_print("Replay buffer exhausted. Transitioning to LIVE MODE.")
             # self._is_replay_mode = False
-            return None # Return None to allow loop to retry in live mode
+            return _BUFFER_EXHAUSTED # Return None to allow loop to retry in live mode
         
         entry = self._recv_buffer.next_entry()
         return entry.payload
