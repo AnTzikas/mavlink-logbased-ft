@@ -62,26 +62,63 @@ class MAVLinkDispatcher:
     so every self._conn.<method> call (recv_match, mav.*_send, ...) is
     transparently routed through whichever backend is active."""
 
-    def __init__(self, connection_string: str, discovery_timeout_s: float = 10.0):
+    def __init__(self, connection_string: str, discovery_timeout_s: float = 10.0,
+                 expected_drones: int | None = None):
         self._conn               = mav_connect(connection_string)
         self._drones: dict[int, "Drone"] = {}
         self.discovery_timeout_s = discovery_timeout_s
+        # Number of drones to expect. When set, discovery stops as soon as
+        # this many distinct drones have been seen -- a CONTENT-based exit
+        # condition (depends only on which messages arrived), so it replays
+        # identically. A wall-clock window would make a different number of
+        # recv_match calls at replay (replay runs faster than real time),
+        # desyncing the recorded receive stream from the caller's calls.
+        self.expected_drones     = expected_drones
 
     def discover(self) -> list[int]:
-        print("[DISCOVER] Listening for heartbeats ({0}s)...".format(self.discovery_timeout_s))
-        seen: dict[int, float] = {}
-        deadline = time.time() + self.discovery_timeout_s
+        """Listen for HEARTBEATs and return the distinct drone sysids found.
 
-        while time.time() < deadline:
+        REPLAY-DETERMINISM: the loop must issue the SAME sequence of
+        recv_match calls at record and at replay, or the wrapper's recorded
+        receive stream desyncs from the caller. A wall-clock deadline does NOT
+        satisfy this -- replay runs much faster than real time, so a
+        `while time.time() < deadline` loop makes a different number of calls.
+
+        Instead the exit condition is CONTENT-based:
+          - if expected_drones is set, stop as soon as that many distinct
+            drones have been seen (this depends only on which messages
+            arrived, which is identical at record and replay);
+          - a fixed MAX iteration cap bounds the loop so it can never spin
+            forever if a drone never appears (also a fixed count -> the call
+            sequence stays identical across record/replay even in the
+            not-all-found case).
+
+        The wall-clock timeout is kept ONLY as a coarse outer safety bound for
+        the not-found case and is derived into a fixed number of recv attempts,
+        not checked against time.time() inside the loop.
+        """
+        if self.expected_drones is not None:
+            print("[DISCOVER] Listening for heartbeats (expecting {0} drone(s))...".format(
+                self.expected_drones))
+        else:
+            print("[DISCOVER] Listening for heartbeats...")
+
+        seen: dict[int, int] = {}
+        # Fixed cap on recv_match calls: derived from the timeout and the 1s
+        # per-call blocking timeout, so it's a constant number, not a clock
+        # check. This is what makes the call sequence deterministic.
+        max_attempts = max(1, int(self.discovery_timeout_s))
+
+        for _attempt in range(max_attempts):
             msg = self._conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1.0)
-            if msg is None:
-                continue
-            sysid = msg.get_srcSystem()
-            if sysid in (0, 255):   # ignore broadcast and GCS heartbeats
-                continue
-            if sysid not in seen:
-                seen[sysid] = time.time()
-                print("[DISCOVER] Found drone sysid={0}".format(sysid))
+            if msg is not None:
+                sysid = msg.get_srcSystem()
+                if sysid not in (0, 255) and sysid not in seen:   # skip broadcast/GCS
+                    seen[sysid] = _attempt
+                    print("[DISCOVER] Found drone sysid={0}".format(sysid))
+            # Content-based early exit: we have everyone we expected.
+            if self.expected_drones is not None and len(seen) >= self.expected_drones:
+                break
 
         found = sorted(seen.keys())
         print("[DISCOVER] Done. Found {0} drone(s): {1}".format(len(found), found))
@@ -178,6 +215,22 @@ class Drone:
         self._heading_deg: float | None = None    # compass heading, from GLOBAL_POSITION_INT.hdg
         self._boot_ms: int | None = None          # autopilot uptime (GLOBAL_POSITION_INT.time_boot_ms) -- restore-safe clock
         self._last_hb_vt: int | None = None       # vehicle clock (time_boot_ms) at last heartbeat
+        # Gimbal attitude feedback (from GIMBAL_DEVICE_ATTITUDE_STATUS).
+        # _gimbal_pitch_deg is the ACTUAL pitch reported by the gimbal;
+        # _cmd_gimbal_pitch_deg is the last pitch we COMMANDED via point_gimbal.
+        # Comparing the two lets the mission wait for the gimbal to actually
+        # arrive before capturing, instead of guessing with a fixed timer.
+        self._gimbal_pitch_deg: float | None = None
+        self._gimbal_yaw_deg: float | None = None
+        self._cmd_gimbal_pitch_deg: float | None = None
+        self._cmd_gimbal_yaw_deg: float | None = None
+        # Ground velocity (m/s) from GLOBAL_POSITION_INT vx/vy/vz. Used by the
+        # mission to require the drone has actually STOPPED (not merely arrived
+        # within tolerance) before the next command -- so captures happen from
+        # a settled, level platform instead of mid-deceleration.
+        self._vx = 0.0
+        self._vy = 0.0
+        self._vz = 0.0
 
         # Camera ACK tracking. COMMAND_ACK carries no request_id of its
         # own (it only has 'command' and 'result'), so we can't match
@@ -212,6 +265,10 @@ class Drone:
             self._lon     = msg.lon / 1e7
             self._alt_rel = msg.relative_alt / 1000.0
             self._boot_ms = msg.time_boot_ms
+            # velocity is reported in cm/s -> convert to m/s
+            self._vx = msg.vx / 100.0
+            self._vy = msg.vy / 100.0
+            self._vz = msg.vz / 100.0
             # hdg is compass heading in centidegrees, 0-35999, or
             # 65535 if unknown/unavailable
             if msg.hdg != 65535:
@@ -253,6 +310,70 @@ class Drone:
             # battery_remaining is -1 if not available, otherwise 0-100
             if msg.battery_remaining >= 0:
                 self._battery_remaining = msg.battery_remaining
+
+        elif t == "GIMBAL_DEVICE_ATTITUDE_STATUS":
+            # Actual gimbal orientation, as a quaternion q=[w,x,y,z]. Convert to
+            # pitch/yaw so the mission can tell when the gimbal has reached the
+            # commanded angle. angular_velocity_* are often nan in SITL, so we
+            # rely on ANGLE arrival (current vs commanded), not velocity.
+            q = msg.q
+            pitch, yaw = self._quat_to_pitch_yaw(q)
+            if pitch is not None:
+                self._gimbal_pitch_deg = pitch
+                self._gimbal_yaw_deg   = yaw
+
+    def get_speed(self) -> float:
+        """Current ground speed magnitude in m/s (sqrt(vx^2+vy^2+vz^2)), from
+        GLOBAL_POSITION_INT. The mission uses this to confirm the drone has
+        actually stopped at a target before proceeding -- arriving within the
+        tolerance radius is not the same as being stationary and level."""
+        return math.sqrt(self._vx * self._vx + self._vy * self._vy + self._vz * self._vz)
+
+    @staticmethod
+    def _quat_to_pitch_yaw(q):
+        """Convert a MAVLink attitude quaternion q=[w,x,y,z] to (pitch_deg,
+        yaw_deg). Returns (None, None) on a degenerate/invalid quaternion.
+        Pitch is the gimbal's tilt: 0 = horizontal/forward, -90 = straight
+        down -- matching the convention point_gimbal() uses."""
+        try:
+            w, x, y, z = q[0], q[1], q[2], q[3]
+            # normalize (guard against drift / zero quaternion)
+            n = math.sqrt(w*w + x*x + y*y + z*z)
+            if n == 0.0:
+                return None, None
+            w, x, y, z = w/n, x/n, y/n, z/n
+            # pitch (about Y): asin(2*(w*y - z*x)), clamped
+            sinp = 2.0 * (w*y - z*x)
+            sinp = max(-1.0, min(1.0, sinp))
+            pitch = math.degrees(math.asin(sinp))
+            # yaw (about Z)
+            siny = 2.0 * (w*z + x*y)
+            cosy = 1.0 - 2.0 * (y*y + z*z)
+            yaw = math.degrees(math.atan2(siny, cosy))
+            return pitch, yaw
+        except Exception:
+            return None, None
+
+    def get_gimbal_pitch(self) -> float | None:
+        """Actual gimbal pitch in degrees (0 = horizontal, -90 = down), or
+        None if no GIMBAL_DEVICE_ATTITUDE_STATUS has been received yet."""
+        return self._gimbal_pitch_deg
+
+    def get_gimbal_yaw(self) -> float | None:
+        """Actual gimbal yaw in degrees, or None if not yet known."""
+        return self._gimbal_yaw_deg
+
+    def get_commanded_gimbal_pitch(self) -> float | None:
+        """The last pitch commanded via point_gimbal(), or None if never set."""
+        return self._cmd_gimbal_pitch_deg
+
+    def gimbal_pitch_error(self) -> float | None:
+        """Absolute difference (deg) between commanded and actual gimbal pitch,
+        or None if either is unknown. The mission uses this to decide the
+        gimbal has 'arrived' before capturing."""
+        if self._cmd_gimbal_pitch_deg is None or self._gimbal_pitch_deg is None:
+            return None
+        return abs(self._cmd_gimbal_pitch_deg - self._gimbal_pitch_deg)
 
     def _set_mode(self, mode_id: int, timeout: float = 3.0) -> str:
         deadline = time.time() + timeout
@@ -525,6 +646,10 @@ class Drone:
         Fire-and-forget -- no ACK wait, since the gimbal's actual
         joint position is observed by polling, not by a MAVLink ACK.
         """
+        # Remember what we commanded so the mission can poll for arrival
+        # (actual pitch -> gimbal_pitch_error()) instead of a fixed wait.
+        self._cmd_gimbal_pitch_deg = pitch_deg
+        self._cmd_gimbal_yaw_deg   = yaw_deg
         self._dispatcher.send_command_long(
             self._sysid,
             mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL,
