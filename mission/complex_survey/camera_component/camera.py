@@ -50,6 +50,10 @@ class Camera:
         self._output_dir = output_dir
         self._world_name = world_name
         self._drone_name = drone_name
+        # Settle applied right after (re)enabling the stream, so the first RTP
+        # packets are flowing before a capture is attempted. Small on purpose:
+        # enable-on-demand calls this before every capture.
+        self._enable_settle_s = 0.4
 
     # -----------------------------------------------------------------------
     # Setup
@@ -72,6 +76,11 @@ class Camera:
             capture_output=True, text=True,
         )
         if result.returncode == 0:
+            # Give the RTP stream a brief moment to actually start producing
+            # packets before the caller grabs a frame. Without this, a capture
+            # issued immediately after a fresh enable can race the first packet
+            # and fail (ffmpeg: "Output file does not contain any stream").
+            time.sleep(self._enable_settle_s)
             print("[CAMERA] Stream enabled on UDP:{0}".format(self._udp_port))
         else:
             print("[CAMERA] Warning enabling stream: {0}".format(
@@ -115,9 +124,18 @@ class Camera:
             out_dir = os.path.join(self._output_dir, subdir)
             os.makedirs(out_dir, exist_ok=True)
 
-        delay = 0.6 #old was 0.3
+        delay = 0.5   # backoff base for REAL failures
+        port_busy_delay = 0.05   # near-immediate retry for TIME_WAIT port reuse
         for attempt in range(1, max_retries + 1):
             result_path = self._try_capture_once(label_str, out_dir)
+            if result_path == "__PORT_BUSY__":
+                # Transient port-in-use: the just-exited ffmpeg's socket is still
+                # in TIME_WAIT. Retry fast; this does NOT count toward the slow
+                # backoff and is essentially free.
+                if attempt < max_retries:
+                    time.sleep(port_busy_delay)
+                    continue
+                return None
             if result_path is not None:
                 return result_path
 
@@ -162,8 +180,14 @@ class Camera:
             )
 
             if result.returncode != 0:
-                print("[CAMERA] ffmpeg error: {0}".format(
-                    result.stderr.decode().strip()))
+                err = result.stderr.decode().strip()
+                # "Address already in use" is a transient: the previous capture's
+                # ffmpeg UDP socket on this same port is still in TIME_WAIT. It
+                # clears in tens of ms, so signal the caller to retry FAST rather
+                # than applying the full backoff meant for real failures.
+                if "Address already in use" in err or "bind failed" in err:
+                    return "__PORT_BUSY__"
+                print("[CAMERA] ffmpeg error: {0}".format(err))
                 return None
 
             if not os.path.exists(out_path):

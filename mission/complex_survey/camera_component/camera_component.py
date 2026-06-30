@@ -135,11 +135,22 @@ def main() -> int:
             request_id, requester_sysid, requester_compid))
 
         try:
+            # local_path = camera.capture("capture_{0}".format(request_id))
+            # if local_path is None:
+            #     raise RuntimeError("Gazebo capture failed")
+            # print("[CAMERA_COMPONENT] Warming up camera stream...")
+            # camera.enable_stream()
+            # time.sleep(1.5)  # Give Gazebo time to push fresh frames
+
             local_path = camera.capture("capture_{0}".format(request_id))
+
+            # camera.disable_stream()  # Turn off to prevent stale buffers!
+
             if local_path is None:
                 raise RuntimeError("Gazebo capture failed")
-
+        
             remote_path = "{0}/capture_{1}.jpg".format(args.remote_dir, request_id)
+            # remote_path = "{0}/{1}/capture_{2}.jpg".format(args.remote_dir, args.drone_name, request_id)
             ftp.put_file(local_path, remote_path)
             print("[CAMERA_COMPONENT] Uploaded -> {0}".format(remote_path))
 
